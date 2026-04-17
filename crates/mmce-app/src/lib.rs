@@ -1,0 +1,617 @@
+//! eframe-backed app layer for mmce.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use egui::{CentralPanel, Color32, Context, Vec2, ViewportCommand};
+use mmce_codecs::{folder_has_direct_images, is_archive_path, PageSource};
+use mmce_config::{FitMode, PageMode, Settings};
+use mmce_core::{stride, Book, Spread, ViewerState};
+use mmce_render::{compute_size, PageCache};
+
+mod explorer;
+mod input;
+mod thumbs;
+
+use explorer::{Entry, EntryKind, ExplorerState};
+
+#[derive(Debug, Default, Clone)]
+pub struct CliArgs {
+    pub paths: Vec<PathBuf>,
+    pub fullscreen: bool,
+    pub last: bool,
+    pub ini: Option<PathBuf>,
+    pub view_mode: Option<u8>,
+    pub add: bool,
+}
+
+pub struct App {
+    settings: Settings,
+    settings_path: PathBuf,
+    book: Option<Book>,
+    cache: Option<PageCache>,
+    viewer: ViewerState,
+    status: String,
+    last_error: Option<String>,
+    pub(crate) current_path: Option<PathBuf>,
+    pub(crate) view: View,
+    pub(crate) explorer: Option<ExplorerState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Book,
+    Explorer,
+}
+
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>, cli: CliArgs) -> Self {
+        let settings_path = cli
+            .ini
+            .clone()
+            .unwrap_or_else(default_settings_path);
+
+        let mut settings = Settings::load(&settings_path).unwrap_or_default();
+        if cli.fullscreen {
+            settings.general.fullscreen = true;
+        }
+
+        let mut viewer = ViewerState::from_settings(&settings);
+        if cli.fullscreen {
+            viewer.fullscreen = true;
+        }
+
+        let start_path = cli.paths.first().cloned().or_else(|| {
+            if cli.last {
+                settings.general.current_folder.clone()
+            } else {
+                None
+            }
+        });
+
+        let view = match (cli.view_mode, start_path.is_some()) {
+            (Some(2), _) => View::Explorer,
+            (_, false) => View::Explorer,
+            _ => View::Book,
+        };
+
+        let mut app = Self {
+            settings,
+            settings_path,
+            book: None,
+            cache: None,
+            viewer,
+            status: String::new(),
+            last_error: None,
+            current_path: None,
+            view,
+            explorer: None,
+        };
+
+        if let Some(p) = start_path {
+            app.open_path(&cc.egui_ctx, &p);
+        }
+
+        if app.view == View::Explorer && app.explorer.is_none() {
+            let dir = app.explorer_start_dir();
+            app.explorer = Some(ExplorerState::new(&cc.egui_ctx, dir));
+        }
+
+        if app.viewer.fullscreen {
+            cc.egui_ctx
+                .send_viewport_cmd(ViewportCommand::Fullscreen(true));
+        }
+        app
+    }
+
+    fn explorer_start_dir(&self) -> PathBuf {
+        if let Some(p) = &self.current_path {
+            if p.is_dir() {
+                return p.clone();
+            }
+            if let Some(parent) = p.parent() {
+                return parent.to_path_buf();
+            }
+        }
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+
+    pub fn open_path(&mut self, ctx: &Context, path: &Path) {
+        if path.is_dir() && !folder_has_direct_images(path) {
+            self.current_path = Some(path.to_path_buf());
+            match self.explorer.as_mut() {
+                Some(e) => e.cd(path.to_path_buf()),
+                None => self.explorer = Some(ExplorerState::new(ctx, path.to_path_buf())),
+            }
+            self.view = View::Explorer;
+            self.last_error = None;
+            self.status = format!("Browsing {}", path.display());
+            return;
+        }
+        match Book::open(path) {
+            Ok(book) => {
+                let pages = book.len();
+                let source: Arc<dyn PageSource> = book.source().clone();
+                let cache = PageCache::new(
+                    ctx.clone(),
+                    source,
+                    self.settings.cache.picture_cache_size as usize,
+                );
+                self.status = format!("Loaded {} ({} pages)", book.title(), pages);
+                self.last_error = if pages == 0 {
+                    Some(format!(
+                        "No images found in {} — try a folder of PNG/JPEG pages or an archive.",
+                        path.display()
+                    ))
+                } else {
+                    None
+                };
+                self.settings.general.current_folder = Some(path.to_path_buf());
+                self.current_path = Some(path.to_path_buf());
+                self.book = Some(book);
+                self.cache = Some(cache);
+                if pages > 0 {
+                    self.view = View::Book;
+                }
+            }
+            Err(e) => {
+                self.last_error = Some(format!("open {}: {}", path.display(), e));
+                self.status = self.last_error.clone().unwrap_or_default();
+            }
+        }
+    }
+
+    fn save_settings(&mut self) {
+        self.settings.general.fullscreen = self.viewer.fullscreen;
+        self.settings.scale.mode = self.viewer.fit;
+        self.settings.scale.optional_scale = self.viewer.zoom;
+        self.settings.view.page_mode = self.viewer.page_mode;
+        self.settings.view.bind_dir = self.viewer.bind_dir;
+        if let Err(e) = self.settings.save(&self.settings_path) {
+            log::warn!("save settings: {e}");
+        }
+    }
+
+    /// Backspace in Book view: return to the explorer rooted at the book's
+    /// parent directory, with the book's own entry pre-selected and
+    /// scrolled into view. Fullscreen state is preserved — only the user's
+    /// explicit F11 / Esc / Alt+Enter toggles flip it.
+    pub(crate) fn back_to_explorer(&mut self, ctx: &Context) {
+        let cur = match &self.current_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let parent = match cur.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return,
+        };
+
+        // Build (or reuse) the explorer at `parent`.
+        match self.explorer.as_mut() {
+            Some(state) if state.current == parent => { /* already there */ }
+            Some(state) => state.cd(parent.clone()),
+            None => self.explorer = Some(ExplorerState::new(ctx, parent.clone())),
+        }
+
+        // Select the entry that matches the book we just left. For folder
+        // books whose path is the folder itself this is a direct hit; for a
+        // loose image we fall back to selecting the image's own tile.
+        if let Some(state) = self.explorer.as_mut() {
+            if let Some(idx) = state.entries().iter().position(|e| e.path == cur) {
+                state.selection = idx;
+            }
+        }
+
+        self.view = View::Explorer;
+    }
+
+    pub(crate) fn toggle_explorer(&mut self, ctx: &Context) {
+        self.view = match self.view {
+            View::Book => {
+                if self.explorer.is_none() {
+                    self.explorer = Some(ExplorerState::new(ctx, self.explorer_start_dir()));
+                }
+                View::Explorer
+            }
+            View::Explorer => {
+                if self.book.is_some() {
+                    View::Book
+                } else {
+                    View::Explorer
+                }
+            }
+        };
+    }
+
+    pub(crate) fn open_dialog(&mut self, ctx: &Context) {
+        if let Some(p) = rfd::FileDialog::new()
+            .add_filter(
+                "Images & archives",
+                &[
+                    "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff",
+                    "zip", "cbz", "7z", "cb7",
+                ],
+            )
+            .pick_file()
+        {
+            self.open_path(ctx, &p);
+        }
+    }
+
+    pub(crate) fn open_folder_dialog(&mut self, ctx: &Context) {
+        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+            self.open_path(ctx, &dir);
+        }
+    }
+
+    fn handle_explorer_click(&mut self, ctx: &Context, entry: Entry) {
+        match entry.kind {
+            EntryKind::ParentDir => {
+                if let Some(state) = self.explorer.as_mut() {
+                    state.cd(entry.path);
+                }
+            }
+            EntryKind::Folder => {
+                if folder_has_direct_images(&entry.path) {
+                    self.open_path(ctx, &entry.path);
+                } else if let Some(state) = self.explorer.as_mut() {
+                    state.cd(entry.path);
+                }
+            }
+            EntryKind::Archive | EntryKind::Image => {
+                self.open_path(ctx, &entry.path);
+            }
+        }
+    }
+
+    pub(crate) fn explorer_activate(&mut self, ctx: &Context) {
+        let entry = self.explorer.as_ref().and_then(|e| e.selected().cloned());
+        if let Some(e) = entry {
+            self.handle_explorer_click(ctx, e);
+        }
+    }
+
+    pub(crate) fn explorer_up(&mut self) {
+        if let Some(state) = self.explorer.as_mut() {
+            state.go_parent();
+        }
+    }
+
+    pub(crate) fn explorer_move(&mut self, dx: isize, dy: isize) {
+        if let Some(state) = self.explorer.as_mut() {
+            state.move_selection(dx, dy);
+        }
+    }
+
+    pub(crate) fn explorer_thumb_bigger(&mut self) {
+        if let Some(state) = self.explorer.as_mut() {
+            state.thumb_bigger();
+        }
+    }
+
+    pub(crate) fn explorer_thumb_smaller(&mut self) {
+        if let Some(state) = self.explorer.as_mut() {
+            state.thumb_smaller();
+        }
+    }
+
+    /// The directory whose *siblings* Shift+Up/Down should walk. In Book
+    /// view that's the book's containing folder (or the archive file
+    /// itself, or the dir holding a loose image). In Explorer view it's
+    /// whatever the user has browsed into, not the first path they opened.
+    fn current_nav_dir(&self) -> Option<PathBuf> {
+        match self.view {
+            View::Explorer => self.explorer.as_ref().map(|e| e.current.clone()),
+            View::Book => {
+                let p = self.current_path.as_ref()?;
+                if p.is_dir() || is_archive_path(p) {
+                    Some(p.clone())
+                } else {
+                    p.parent().map(Path::to_path_buf)
+                }
+            }
+        }
+    }
+
+    /// Navigate to the previous / next sibling folder or archive at the
+    /// current navigation level (Shift+Up / Shift+Down).
+    pub(crate) fn jump_sibling(&mut self, ctx: &Context, delta: isize) {
+        let cur = match self.current_nav_dir() {
+            Some(p) => p,
+            None => return,
+        };
+        let parent = match cur.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return,
+        };
+        // Same ordering the explorer grid uses: folders first (natural
+        // sort), then archives (natural sort). Everything else is ignored
+        // — Shift+↑/↓ should only hop between "book-shaped" neighbours.
+        let (mut folders, mut archives): (Vec<PathBuf>, Vec<PathBuf>) = match fs::read_dir(&parent) {
+            Ok(rd) => rd.flatten().filter_map(|e| Some(e.path())).fold(
+                (Vec::new(), Vec::new()),
+                |(mut f, mut a), p| {
+                    if p.is_dir() {
+                        f.push(p);
+                    } else if is_archive_path(&p) {
+                        a.push(p);
+                    }
+                    (f, a)
+                },
+            ),
+            Err(_) => return,
+        };
+        let name_key = |p: &Path| {
+            p.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        folders.sort_by(|a, b| natord::compare(&name_key(a), &name_key(b)));
+        archives.sort_by(|a, b| natord::compare(&name_key(a), &name_key(b)));
+        let mut siblings: Vec<PathBuf> = folders;
+        siblings.extend(archives);
+        if siblings.is_empty() {
+            return;
+        }
+        let idx = siblings.iter().position(|p| p == &cur).unwrap_or(0) as isize;
+        let last = (siblings.len() - 1) as isize;
+        let new = (idx + delta).clamp(0, last) as usize;
+        let next = siblings[new].clone();
+        if next != cur {
+            self.open_path(ctx, &next);
+        }
+    }
+
+    pub(crate) fn advance_pages(&mut self, delta: isize) {
+        if let Some(b) = self.book.as_mut() {
+            b.advance(delta);
+        }
+    }
+
+    /// Resolve Auto → Single/Spread using whatever page dimensions are
+    /// currently cached. Unknown pages default to portrait (spread).
+    fn effective_mode(&self) -> PageMode {
+        match (self.viewer.page_mode, self.book.as_ref(), self.cache.as_ref()) {
+            (PageMode::Auto, Some(book), Some(cache)) => {
+                let a = book.cursor();
+                let a_land = cache
+                    .page_dimensions(a)
+                    .map(|(w, h)| w > h)
+                    .unwrap_or(false);
+                let b_land = if a + 1 < book.len() {
+                    cache
+                        .page_dimensions(a + 1)
+                        .map(|(w, h)| w > h)
+                        .unwrap_or(false)
+                } else {
+                    true
+                };
+                if a_land || b_land {
+                    PageMode::Single
+                } else {
+                    PageMode::Spread
+                }
+            }
+            (mode, _, _) => mode,
+        }
+    }
+
+    /// Stride in pages for the current navigation mode.
+    pub(crate) fn current_stride(&self) -> usize {
+        stride(self.effective_mode())
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        input::handle(self, ctx);
+
+        let bg_book = egui::Color32::from_rgb(
+            (self.viewer.bg_color & 0xFF) as u8,
+            ((self.viewer.bg_color >> 8) & 0xFF) as u8,
+            ((self.viewer.bg_color >> 16) & 0xFF) as u8,
+        );
+
+        let mut clicked: Option<Entry> = None;
+        let effective = self.effective_mode();
+
+        CentralPanel::default()
+            .frame(egui::Frame::none().fill(bg_book))
+            .show(ctx, |ui| match self.view {
+                View::Book => match (self.book.as_ref(), self.cache.as_ref()) {
+                    (Some(book), Some(cache)) if book.len() > 0 => {
+                        let spread = book.current_spread(effective, self.viewer.bind_dir);
+                        draw_spread(
+                            ui,
+                            spread,
+                            cache,
+                            &self.viewer,
+                            self.settings.scale.no_zoom_in,
+                        );
+                        let window: Vec<usize> = spread.indices().collect();
+                        if self.settings.cache.preload {
+                            cache.prefetch(&window, 2);
+                        }
+                    }
+                    _ => draw_welcome(ui, self.last_error.as_deref()),
+                },
+                View::Explorer => {
+                    if let Some(state) = self.explorer.as_mut() {
+                        clicked = explorer::draw(ui, state);
+                    }
+                }
+            });
+
+        if let Some(entry) = clicked {
+            self.handle_explorer_click(ctx, entry);
+        }
+
+        // Status bar.
+        egui::TopBottomPanel::bottom("status")
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::from_black_alpha(160))
+                    .inner_margin(egui::Margin::symmetric(8.0, 2.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    match self.view {
+                        View::Book => {
+                            if let Some(book) = &self.book {
+                                let mode_str = match self.viewer.page_mode {
+                                    PageMode::Single => "single",
+                                    PageMode::Spread => "spread",
+                                    PageMode::Auto => match effective {
+                                        PageMode::Single => "auto→1",
+                                        _ => "auto→2",
+                                    },
+                                };
+                                ui.colored_label(
+                                    Color32::LIGHT_GRAY,
+                                    format!(
+                                        "{} — {}/{}   [{}]   fit={:?} zoom={:.2}",
+                                        book.title(),
+                                        book.cursor() + 1,
+                                        book.len().max(1),
+                                        mode_str,
+                                        self.viewer.fit,
+                                        self.viewer.zoom,
+                                    ),
+                                );
+                            } else {
+                                ui.colored_label(Color32::LIGHT_GRAY, &self.status);
+                            }
+                        }
+                        View::Explorer => {
+                            ui.colored_label(Color32::LIGHT_GRAY, "Explorer");
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.colored_label(
+                            Color32::DARK_GRAY,
+                            match self.view {
+                                View::Book => {
+                                    "E explorer · PgUp/Dn ±10 · Shift+↑/↓ sibling · Space mode"
+                                }
+                                View::Explorer => {
+                                    "↑↓←→ select · Enter open · ⌫ up · Ctrl± resize"
+                                }
+                            },
+                        );
+                    });
+                });
+            });
+
+        // File drops.
+        let dropped: Vec<_> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if let Some(first) = dropped.first() {
+            self.open_path(ctx, first);
+        }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_settings();
+    }
+}
+
+fn draw_welcome(ui: &mut egui::Ui, err: Option<&str>) {
+    ui.centered_and_justified(|ui| {
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new("mmce")
+                    .color(Color32::LIGHT_GRAY)
+                    .size(48.0),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(
+                    "Press E for the explorer gallery, O to pick a file, \
+                     Shift+O for a folder, or drop a path here.",
+                )
+                .color(Color32::GRAY),
+            );
+            if let Some(msg) = err {
+                ui.add_space(12.0);
+                ui.colored_label(Color32::LIGHT_RED, msg);
+            }
+        });
+    });
+}
+
+fn draw_spread(
+    ui: &mut egui::Ui,
+    spread: Spread,
+    cache: &PageCache,
+    viewer: &ViewerState,
+    no_zoom_in_cfg: bool,
+) {
+    let viewport = ui.available_size();
+
+    let pages: Vec<(usize, egui::TextureHandle)> = spread
+        .indices()
+        .filter_map(|idx| cache.texture(idx).map(|t| (idx, t)))
+        .collect();
+
+    if pages.is_empty() {
+        ui.centered_and_justified(|ui| {
+            ui.spinner();
+        });
+        return;
+    }
+
+    let intrinsic: Vec2 = pages.iter().fold(Vec2::ZERO, |acc, (_, t)| {
+        let s = t.size_vec2();
+        Vec2::new(acc.x + s.x, acc.y.max(s.y))
+    });
+
+    let rendered = compute_size(
+        intrinsic,
+        viewport,
+        viewer.fit,
+        viewer.zoom,
+        // Custom zoom is always honoured exactly; fit modes obey the
+        // user's NoZoomIn preference, which defaults to false so Fit
+        // will actually upscale smaller images.
+        no_zoom_in_cfg && viewer.fit != FitMode::Custom,
+    );
+    if rendered.x <= 0.0 || rendered.y <= 0.0 {
+        return;
+    }
+    let scale = rendered.x / intrinsic.x;
+
+    let offset = (viewport - rendered) * 0.5 + Vec2::new(viewer.pan[0], viewer.pan[1]);
+    let top_left = ui.min_rect().left_top() + offset;
+
+    let mut cursor_x = top_left.x;
+    for (_, tex) in &pages {
+        let s = tex.size_vec2() * scale;
+        let y = top_left.y + (rendered.y - s.y) * 0.5;
+        let rect = egui::Rect::from_min_size(egui::pos2(cursor_x, y), s);
+        egui::Image::from_texture(tex)
+            .fit_to_exact_size(s)
+            .paint_at(ui, rect);
+        cursor_x += s.x;
+    }
+}
+
+fn default_settings_path() -> PathBuf {
+    if let Some(dirs) = dirs_config() {
+        dirs.join("mmce").join("mmce.ini")
+    } else {
+        PathBuf::from("mmce.ini")
+    }
+}
+
+fn dirs_config() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+}

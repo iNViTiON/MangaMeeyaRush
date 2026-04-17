@@ -1,0 +1,7 @@
+/target
+/.direnv
+/result
+/result-*
+Cargo.lock.bak
+*.swp
+.DS_Store
