@@ -832,8 +832,12 @@ impl eframe::App for App {
                                         PagePaint::full(tex.clone(), *rect)
                                     })
                                     .collect();
+                                // The flip's hinge should always live at
+                                // the viewport centre, regardless of pan
+                                // or uneven page widths.
+                                let spine_x = ui.min_rect().center().x;
                                 let (prev_pair, next_pair) =
-                                    normalise_pair(&self.last_book_paint, &next_raw);
+                                    normalise_pair(&self.last_book_paint, &next_raw, spine_x);
                                 self.flip = Some(PageFlip::new(
                                     prev_pair,
                                     next_pair,
@@ -1006,8 +1010,13 @@ fn draw_welcome(ui: &mut egui::Ui, err: Option<&str>) {
     });
 }
 
-/// Returns the page rects the spread was painted into (for overlays such as
-/// the loupe that need to reverse-map screen pixels to source pixels).
+/// Paint the current spread and return the `(idx, tex, rect)` triples
+/// for the painted pages (used by overlays, the loupe, and the page-flip
+/// animation). Spread layout anchors each page's spine-adjacent edge to
+/// the viewport centre — so the fold line is always exactly in the
+/// middle, even when the two pages have different aspect ratios. Single
+/// pages are centred in the full viewport; the halves they get split
+/// into for the flip animation meet at that same middle line.
 fn draw_spread(
     ui: &mut egui::Ui,
     spread: Spread,
@@ -1016,6 +1025,7 @@ fn draw_spread(
     no_zoom_in_cfg: bool,
 ) -> Vec<(usize, egui::TextureHandle, egui::Rect)> {
     let viewport = ui.available_size();
+    let origin = ui.min_rect().left_top();
 
     let pages: Vec<(usize, egui::TextureHandle)> = spread
         .indices()
@@ -1029,61 +1039,75 @@ fn draw_spread(
         return Vec::new();
     }
 
-    let intrinsic: Vec2 = pages.iter().fold(Vec2::ZERO, |acc, (_, t)| {
-        let s = t.size_vec2();
-        Vec2::new(acc.x + s.x, acc.y.max(s.y))
-    });
+    let pan = Vec2::new(viewer.pan[0], viewer.pan[1]);
+    let no_zoom_in = no_zoom_in_cfg && viewer.fit != FitMode::Custom;
 
-    let rendered = compute_size(
-        intrinsic,
-        viewport,
-        viewer.fit,
-        viewer.zoom,
-        // Custom zoom is always honoured exactly; fit modes obey the
-        // user's NoZoomIn preference, which defaults to false so Fit
-        // will actually upscale smaller images.
-        no_zoom_in_cfg && viewer.fit != FitMode::Custom,
-    );
-    if rendered.x <= 0.0 || rendered.y <= 0.0 {
-        return Vec::new();
-    }
-    let scale = rendered.x / intrinsic.x;
-
-    let offset = (viewport - rendered) * 0.5 + Vec2::new(viewer.pan[0], viewer.pan[1]);
-    let top_left = ui.min_rect().left_top() + offset;
-
-    let mut cursor_x = top_left.x;
     let mut rects = Vec::with_capacity(pages.len());
-    for (idx, tex) in pages {
-        let s = tex.size_vec2() * scale;
-        let y = top_left.y + (rendered.y - s.y) * 0.5;
-        let rect = egui::Rect::from_min_size(egui::pos2(cursor_x, y), s);
-        egui::Image::from_texture(&tex)
-            .fit_to_exact_size(s)
-            .paint_at(ui, rect);
-        cursor_x += s.x;
-        rects.push((idx, tex, rect));
+    match pages.len() {
+        1 => {
+            let (idx, tex) = pages.into_iter().next().unwrap();
+            let intrinsic = tex.size_vec2();
+            let rendered =
+                compute_size(intrinsic, viewport, viewer.fit, viewer.zoom, no_zoom_in);
+            if rendered.x <= 0.0 || rendered.y <= 0.0 {
+                return rects;
+            }
+            let offset = (viewport - rendered) * 0.5 + pan;
+            let rect = egui::Rect::from_min_size(origin + offset, rendered);
+            egui::Image::from_texture(&tex)
+                .fit_to_exact_size(rendered)
+                .paint_at(ui, rect);
+            rects.push((idx, tex, rect));
+        }
+        2 => {
+            // Each page is fit independently into half the viewport,
+            // then anchored so its spine-adjacent edge sits on the
+            // viewport's vertical centre line. The other edge and the
+            // height are free to vary between pages.
+            let spine_x = origin.x + viewport.x * 0.5;
+            let half = Vec2::new(viewport.x * 0.5, viewport.y);
+            for (i, (idx, tex)) in pages.into_iter().enumerate() {
+                let intrinsic = tex.size_vec2();
+                let rendered =
+                    compute_size(intrinsic, half, viewer.fit, viewer.zoom, no_zoom_in);
+                if rendered.x <= 0.0 || rendered.y <= 0.0 {
+                    continue;
+                }
+                let y = origin.y + (viewport.y - rendered.y) * 0.5 + pan.y;
+                // i == 0 is the physical left page; anchor its right
+                // edge at the spine. i == 1 is the right page; anchor
+                // its left edge at the spine.
+                let x = if i == 0 {
+                    spine_x - rendered.x + pan.x
+                } else {
+                    spine_x + pan.x
+                };
+                let rect = egui::Rect::from_min_size(egui::pos2(x, y), rendered);
+                egui::Image::from_texture(&tex)
+                    .fit_to_exact_size(rendered)
+                    .paint_at(ui, rect);
+                rects.push((idx, tex, rect));
+            }
+        }
+        _ => {}
     }
     rects
 }
 
-/// Build the `[left, right]` pair the flip animator wants out of the
-/// raw page rects of the previous and current frames. For spread mode
-/// it's a pass-through; for single-page mode we split each page at its
-/// rendered horizontal centre so the flip folds at the middle — even
-/// when displaying a single image like a real book leaf would.
+/// Build the `[left, right]` pair the flip animator wants. For spread
+/// mode it's a pass-through (the draw code already anchors both pages
+/// to `spine_x`). For single-page mode we split each page at `spine_x`
+/// so the flip folds at the viewport centre — which is the fixed point
+/// the user asked for, independent of the page's intrinsic width.
 fn normalise_pair(
     prev: &[PagePaint],
     next: &[PagePaint],
+    spine_x: f32,
 ) -> (Vec<PagePaint>, Vec<PagePaint>) {
     match (prev.len(), next.len()) {
         (1, 1) => {
-            // Use the union center so both prev/next fold at the same
-            // x-coordinate. This keeps the seam steady when prev and
-            // next happen to render at slightly different widths.
-            let cx = 0.5 * (prev[0].rect.center().x + next[0].rect.center().x);
-            let (pl, pr) = prev[0].clone().split_at(cx);
-            let (nl, nr) = next[0].clone().split_at(cx);
+            let (pl, pr) = prev[0].clone().split_at(spine_x);
+            let (nl, nr) = next[0].clone().split_at(spine_x);
             (vec![pl, pr], vec![nl, nr])
         }
         _ => (prev.to_vec(), next.to_vec()),
