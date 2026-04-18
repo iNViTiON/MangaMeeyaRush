@@ -25,7 +25,7 @@ mod thumbs;
 
 pub(crate) use settings::SettingsDialog;
 
-use anim::{PageFade, PagePaint};
+use anim::{FlipDir, PageFlip, PagePaint};
 use bookmarks::BookmarksDialog;
 use dialogs::GotoDialog;
 use file_ops::{ConfirmDelete, RenameDialog};
@@ -75,10 +75,10 @@ pub struct App {
     /// bookmarks and record reading progress.
     pub(crate) current_book_id: Option<mmce_store::BookId>,
     /// Rects painted last frame — consulted on cursor change to snapshot
-    /// the outgoing spread for a crossfade.
+    /// the outgoing spread for the page-turn animation.
     last_book_paint: Vec<PagePaint>,
     last_book_cursor: Option<usize>,
-    fade: Option<PageFade>,
+    flip: Option<PageFlip>,
     pub(crate) animations_enabled: bool,
 }
 
@@ -189,7 +189,7 @@ impl App {
             current_book_id: None,
             last_book_paint: Vec::new(),
             last_book_cursor: None,
-            fade: None,
+            flip: None,
             animations_enabled: true,
         };
 
@@ -792,21 +792,19 @@ impl eframe::App for App {
             self.goto_page(idx);
         }
 
-        // Detect cursor changes so we can snapshot the outgoing spread
-        // before paint and fade it out.
-        if self.animations_enabled {
-            if let Some(book) = self.book.as_ref() {
-                let cur = book.cursor();
-                let changed = self
-                    .last_book_cursor
-                    .map(|prev| prev != cur)
-                    .unwrap_or(false);
-                if changed && !self.last_book_paint.is_empty() {
-                    self.fade = Some(PageFade::new(self.last_book_paint.clone()));
-                }
-                self.last_book_cursor = Some(cur);
+        // Detect cursor changes + direction so we can kick off a page
+        // flip. Starting the flip is deferred until after draw_spread so
+        // we have the NEW rects to anchor the landing geometry against.
+        let cursor_change = match (self.book.as_ref(), self.last_book_cursor) {
+            (Some(b), Some(prev)) if b.cursor() != prev => {
+                Some(if b.cursor() > prev {
+                    FlipDir::Forward
+                } else {
+                    FlipDir::Backward
+                })
             }
-        }
+            _ => None,
+        };
 
         let mut book_page_rects: Vec<(usize, egui::TextureHandle, egui::Rect)> = Vec::new();
 
@@ -823,10 +821,39 @@ impl eframe::App for App {
                             &self.viewer,
                             self.settings.scale.no_zoom_in,
                         );
-                        // Crossfade overlay: paint the outgoing spread on
-                        // top with decaying alpha.
-                        if let Some(fade) = self.fade.as_ref() {
-                            anim::paint_fade(ui, fade);
+                        // Start a new page-flip if the cursor changed
+                        // this frame. We have both the prev paint (from
+                        // last frame) and the new paint (just captured).
+                        if let Some(dir) = cursor_change {
+                            if self.animations_enabled
+                                && !self.last_book_paint.is_empty()
+                                && !book_page_rects.is_empty()
+                                && self.last_book_paint.len() == book_page_rects.len()
+                            {
+                                let next_paint: Vec<PagePaint> = book_page_rects
+                                    .iter()
+                                    .map(|(_, tex, rect)| PagePaint {
+                                        tex: tex.clone(),
+                                        rect: *rect,
+                                    })
+                                    .collect();
+                                self.flip = Some(PageFlip::new(
+                                    self.last_book_paint.clone(),
+                                    next_paint,
+                                    self.viewer.bind_dir,
+                                    dir,
+                                ));
+                            } else {
+                                // Mismatched structure (e.g. Auto mode
+                                // crossing single/spread) — skip the flip.
+                                self.flip = None;
+                            }
+                        }
+
+                        // Paint the flipping leaf over the freshly-drawn
+                        // new spread.
+                        if let Some(flip) = self.flip.as_ref() {
+                            anim::paint_flip(ui, flip);
                         }
                         if self.overlays.info {
                             overlay::paint_info(ui, book, cache, spread);
@@ -861,8 +888,8 @@ impl eframe::App for App {
         }
 
         // Remember the rects we just painted so the next cursor change
-        // can snapshot them for a fade-out. Drive repaints while the
-        // fade is active, and drop it when it completes.
+        // can snapshot them for the outgoing flip. Drive repaints while
+        // the flip is active, and drop it when it completes.
         self.last_book_paint = book_page_rects
             .iter()
             .map(|(_, tex, rect)| PagePaint {
@@ -870,10 +897,13 @@ impl eframe::App for App {
                 rect: *rect,
             })
             .collect();
-        let drop_fade = self.fade.as_ref().map(|f| f.is_done()).unwrap_or(false);
-        if drop_fade {
-            self.fade = None;
-        } else if self.fade.is_some() {
+        if let Some(b) = self.book.as_ref() {
+            self.last_book_cursor = Some(b.cursor());
+        }
+        let drop_flip = self.flip.as_ref().map(|f| f.is_done()).unwrap_or(false);
+        if drop_flip {
+            self.flip = None;
+        } else if self.flip.is_some() {
             ctx.request_repaint();
         }
 
