@@ -11,6 +11,7 @@ use mmce_core::{stride, Book, Spread, ViewerState};
 use mmce_filters::{FilterOp, Pipeline, Rotation};
 use mmce_render::{compute_size, PageCache};
 
+mod anim;
 mod bookmarks;
 mod dialogs;
 mod explorer;
@@ -21,6 +22,7 @@ mod overlay;
 mod playback;
 mod thumbs;
 
+use anim::{PageFade, PagePaint};
 use bookmarks::BookmarksDialog;
 use dialogs::GotoDialog;
 use file_ops::{ConfirmDelete, RenameDialog};
@@ -68,6 +70,12 @@ pub struct App {
     /// ID of the currently-open book in the store, if any. Used to attach
     /// bookmarks and record reading progress.
     pub(crate) current_book_id: Option<mmce_store::BookId>,
+    /// Rects painted last frame — consulted on cursor change to snapshot
+    /// the outgoing spread for a crossfade.
+    last_book_paint: Vec<PagePaint>,
+    last_book_cursor: Option<usize>,
+    fade: Option<PageFade>,
+    pub(crate) animations_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +182,10 @@ impl App {
             rename: RenameDialog::default(),
             store,
             current_book_id: None,
+            last_book_paint: Vec::new(),
+            last_book_cursor: None,
+            fade: None,
+            animations_enabled: true,
         };
 
         if let Some(p) = start_path {
@@ -769,6 +781,22 @@ impl eframe::App for App {
             self.goto_page(idx);
         }
 
+        // Detect cursor changes so we can snapshot the outgoing spread
+        // before paint and fade it out.
+        if self.animations_enabled {
+            if let Some(book) = self.book.as_ref() {
+                let cur = book.cursor();
+                let changed = self
+                    .last_book_cursor
+                    .map(|prev| prev != cur)
+                    .unwrap_or(false);
+                if changed && !self.last_book_paint.is_empty() {
+                    self.fade = Some(PageFade::new(self.last_book_paint.clone()));
+                }
+                self.last_book_cursor = Some(cur);
+            }
+        }
+
         let mut book_page_rects: Vec<(usize, egui::TextureHandle, egui::Rect)> = Vec::new();
 
         CentralPanel::default()
@@ -784,6 +812,11 @@ impl eframe::App for App {
                             &self.viewer,
                             self.settings.scale.no_zoom_in,
                         );
+                        // Crossfade overlay: paint the outgoing spread on
+                        // top with decaying alpha.
+                        if let Some(fade) = self.fade.as_ref() {
+                            anim::paint_fade(ui, fade);
+                        }
                         if self.overlays.info {
                             overlay::paint_info(ui, book, cache, spread);
                         }
@@ -814,6 +847,23 @@ impl eframe::App for App {
 
         if let Some(entry) = clicked {
             self.handle_explorer_click(ctx, entry);
+        }
+
+        // Remember the rects we just painted so the next cursor change
+        // can snapshot them for a fade-out. Drive repaints while the
+        // fade is active, and drop it when it completes.
+        self.last_book_paint = book_page_rects
+            .iter()
+            .map(|(_, tex, rect)| PagePaint {
+                tex: tex.clone(),
+                rect: *rect,
+            })
+            .collect();
+        let drop_fade = self.fade.as_ref().map(|f| f.is_done()).unwrap_or(false);
+        if drop_fade {
+            self.fade = None;
+        } else if self.fade.is_some() {
+            ctx.request_repaint();
         }
 
         // Status bar.
