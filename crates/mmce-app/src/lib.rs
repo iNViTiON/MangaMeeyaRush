@@ -14,6 +14,7 @@ use mmce_render::{compute_size, PageCache};
 mod bookmarks;
 mod dialogs;
 mod explorer;
+mod file_ops;
 mod history;
 mod input;
 mod overlay;
@@ -22,6 +23,7 @@ mod thumbs;
 
 use bookmarks::BookmarksDialog;
 use dialogs::GotoDialog;
+use file_ops::{ConfirmDelete, RenameDialog};
 use history::HistoryDialog;
 use playback::Playback;
 
@@ -58,6 +60,8 @@ pub struct App {
     pub(crate) goto: GotoDialog,
     pub(crate) bookmarks: BookmarksDialog,
     pub(crate) history: HistoryDialog,
+    pub(crate) confirm_delete: ConfirmDelete,
+    pub(crate) rename: RenameDialog,
     /// Persistent store for history, bookmarks, and per-book state.
     /// `None` when the DB couldn't open (rare; we fall back to in-memory).
     pub(crate) store: Option<mmce_store::Store>,
@@ -166,6 +170,8 @@ impl App {
             goto: GotoDialog::default(),
             bookmarks: BookmarksDialog::default(),
             history: HistoryDialog::default(),
+            confirm_delete: ConfirmDelete::default(),
+            rename: RenameDialog::default(),
             store,
             current_book_id: None,
         };
@@ -520,6 +526,59 @@ impl App {
         }
     }
 
+    pub(crate) fn refresh_explorer(&mut self) {
+        if let Some(state) = self.explorer.as_mut() {
+            state.refresh();
+        }
+    }
+
+    pub(crate) fn toggle_explorer_filter(&mut self) {
+        if let Some(state) = self.explorer.as_mut() {
+            state.show_filter = !state.show_filter;
+            if !state.show_filter {
+                state.filter.clear();
+            }
+        }
+    }
+
+    pub(crate) fn close_explorer_filter(&mut self) {
+        if let Some(state) = self.explorer.as_mut() {
+            state.filter.clear();
+            state.show_filter = false;
+        }
+    }
+
+    /// Open the rename dialog for the currently-selected entry in the
+    /// explorer. No-op in Book view.
+    pub(crate) fn open_rename_dialog(&mut self) {
+        let Some(state) = self.explorer.as_ref() else {
+            return;
+        };
+        let Some(path) = state.selected_path() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            return;
+        }
+        self.rename.open_for(&name);
+    }
+
+    /// Open the delete-confirmation dialog for the selected entry.
+    pub(crate) fn open_delete_dialog(&mut self) {
+        let Some(state) = self.explorer.as_ref() else {
+            return;
+        };
+        let Some(path) = state.selected_path() else {
+            return;
+        };
+        self.confirm_delete.open_for(path);
+    }
+
     /// The directory whose *siblings* Shift+Up/Down should walk. In Book
     /// view that's the book's containing folder (or the archive file
     /// itself, or the dir holding a loose image). In Explorer view it's
@@ -657,6 +716,24 @@ impl eframe::App for App {
         }
         if let Some(path) = self.history.show(ctx) {
             self.open_path(ctx, &path);
+        }
+
+        // File-op dialogs (explorer).
+        if let Some(_path) = self.confirm_delete.show(ctx) {
+            if let Some(state) = self.explorer.as_mut() {
+                match state.delete_selected() {
+                    Ok(_) => self.status = "Deleted.".into(),
+                    Err(e) => self.status = format!("Delete failed: {e}"),
+                }
+            }
+        }
+        if let Some(new_name) = self.rename.show(ctx) {
+            if let Some(state) = self.explorer.as_mut() {
+                match state.rename_selected(&new_name) {
+                    Ok(_) => self.status = format!("Renamed to {new_name}"),
+                    Err(e) => self.status = format!("Rename failed: {e}"),
+                }
+            }
         }
 
         let bg_book = egui::Color32::from_rgb(

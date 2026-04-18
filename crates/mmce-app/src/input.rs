@@ -100,9 +100,6 @@ fn dispatch_key(app: &mut App, ctx: &Context, key: Key, mods: Modifiers) {
             Key::ArrowUp if plain => return app.explorer_move(0, -1),
             Key::Home if plain => return app.explorer_move(-(1 << 20), 0),
             Key::End if plain => return app.explorer_move(1 << 20, 0),
-            // Jump a screenful-ish of rows at a time. We don't track the
-            // actual visible-row count, so 5 rows matches a reasonable
-            // default viewport.
             Key::PageDown if plain => return app.explorer_move(0, 5),
             Key::PageUp if plain => return app.explorer_move(0, -5),
             Key::Enter if plain => return app.explorer_activate(ctx),
@@ -110,6 +107,18 @@ fn dispatch_key(app: &mut App, ctx: &Context, key: Key, mods: Modifiers) {
             Key::Plus | Key::Equals if cmd_only => return app.explorer_thumb_bigger(),
             Key::Minus if cmd_only => return app.explorer_thumb_smaller(),
             Key::E if plain => return app.toggle_explorer(ctx),
+            // F5 refreshes the current directory.
+            Key::F5 => return app.refresh_explorer(),
+            // F2 renames, Delete deletes.
+            Key::F2 if plain => return app.open_rename_dialog(),
+            Key::Delete if plain => return app.open_delete_dialog(),
+            // Ctrl+F: filter toggle.
+            Key::F if cmd_only => return app.toggle_explorer_filter(),
+            // Escape closes the filter bar first; falls through to fullscreen exit below.
+            Key::Escape if plain && app.explorer.as_ref().map(|e| e.show_filter).unwrap_or(false) => {
+                app.close_explorer_filter();
+                return;
+            }
             Key::F11 | Key::Escape => { /* fall through to shared handler */ }
             _ => {
                 // fall through for dialogs / fullscreen / open

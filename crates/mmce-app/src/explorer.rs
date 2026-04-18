@@ -34,8 +34,13 @@ pub enum EntryKind {
 pub struct ExplorerState {
     pub current: PathBuf,
     entries: Vec<Entry>,
+    /// Lowercased filter substring; empty = no filter.
+    pub filter: String,
+    /// Whether the filter bar is visible. The filter bar stays open while
+    /// the user types; `Esc` or clicking ✕ clears and hides it.
+    pub show_filter: bool,
     pub cache: ThumbnailCache,
-    /// Keyboard selection index into `entries`.
+    /// Keyboard selection index into the *visible* (post-filter) entries.
     pub selection: usize,
     /// Tile footprint in logical px.
     pub tile_w: f32,
@@ -50,6 +55,8 @@ impl ExplorerState {
         let mut s = Self {
             current: start,
             entries: Vec::new(),
+            filter: String::new(),
+            show_filter: false,
             cache: ThumbnailCache::new(ctx.clone(), 768),
             selection: 0,
             tile_w: 180.0,
@@ -73,9 +80,27 @@ impl ExplorerState {
         }
     }
 
-    #[allow(dead_code)]
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    /// The entries actually on screen after the filter is applied.
+    pub fn visible_entries(&self) -> Vec<&Entry> {
+        if self.filter.is_empty() {
+            return self.entries.iter().collect();
+        }
+        let needle = self.filter.to_lowercase();
+        self.entries
+            .iter()
+            .filter(|e| e.label.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    /// Selected path in the filtered view, if any.
+    pub fn selected_path(&self) -> Option<PathBuf> {
+        self.visible_entries()
+            .get(self.selection)
+            .map(|e| e.path.clone())
     }
 
     /// Keep thumbnails and tiles proportional. Re-decode on change.
@@ -106,13 +131,14 @@ impl ExplorerState {
     }
 
     pub fn move_selection(&mut self, dx: isize, dy: isize) {
-        if self.entries.is_empty() {
+        let n = self.visible_entries().len();
+        if n == 0 {
             return;
         }
         let cols = self.columns.max(1) as isize;
         let cur = self.selection as isize;
         let want = cur + dx + dy * cols;
-        let last = (self.entries.len() - 1) as isize;
+        let last = (n - 1) as isize;
         self.selection = want.clamp(0, last) as usize;
     }
 
@@ -129,6 +155,56 @@ impl ExplorerState {
             self.selection = i;
         }
         Some(self.current.clone())
+    }
+
+    /// Rename the currently-selected entry and refresh. `new_name` is the
+    /// new *filename* (no directory part); it's placed in the entry's
+    /// parent directory.
+    pub fn rename_selected(&mut self, new_name: &str) -> std::io::Result<()> {
+        let Some(src) = self.selected_path() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no selection",
+            ));
+        };
+        let parent = src.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent dir")
+        })?;
+        let dst = parent.join(new_name);
+        if dst.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "target already exists",
+            ));
+        }
+        std::fs::rename(&src, &dst)?;
+        self.refresh();
+        // Re-select the renamed entry if we can find it in the filtered view.
+        if let Some(i) = self
+            .visible_entries()
+            .iter()
+            .position(|e| e.path == dst)
+        {
+            self.selection = i;
+        }
+        Ok(())
+    }
+
+    /// Delete the currently-selected entry (recursively for directories).
+    pub fn delete_selected(&mut self) -> std::io::Result<()> {
+        let Some(path) = self.selected_path() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no selection",
+            ));
+        };
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+        self.refresh();
+        Ok(())
     }
 }
 
@@ -218,6 +294,26 @@ pub fn draw(ui: &mut Ui, state: &mut ExplorerState) -> Option<Entry> {
             );
         });
     });
+
+    if state.show_filter {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Filter:").small().color(Color32::LIGHT_GRAY),
+            );
+            let resp = ui.text_edit_singleline(&mut state.filter);
+            resp.request_focus();
+            if ui.small_button("✕").clicked() {
+                state.filter.clear();
+                state.show_filter = false;
+            }
+            let count = state.visible_entries().len();
+            ui.label(
+                egui::RichText::new(format!("{count} matches"))
+                    .small()
+                    .color(Color32::DARK_GRAY),
+            );
+        });
+    }
     ui.separator();
 
     let tile_w = state.tile_w;
@@ -231,14 +327,23 @@ pub fn draw(ui: &mut Ui, state: &mut ExplorerState) -> Option<Entry> {
     let selection = state.selection;
     let thumb_size = state.thumb_size;
 
+    // Materialise the filtered view once, then walk it in visual order.
+    // `selection` is an index into this vector.
+    let visible: Vec<Entry> = state.visible_entries().into_iter().cloned().collect();
+
     ScrollArea::vertical()
         .auto_shrink([false; 2])
         .show(ui, |ui| {
-            if state.entries.is_empty() {
-                ui.colored_label(Color32::GRAY, "(empty folder)");
+            if visible.is_empty() {
+                let msg = if state.filter.is_empty() {
+                    "(empty folder)"
+                } else {
+                    "(no matches)"
+                };
+                ui.colored_label(Color32::GRAY, msg);
                 return;
             }
-            let mut it = state.entries.iter().enumerate();
+            let mut it = visible.iter().enumerate();
             loop {
                 let row: Vec<(usize, &Entry)> = it.by_ref().take(columns).collect();
                 if row.is_empty() {
