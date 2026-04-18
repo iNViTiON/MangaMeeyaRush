@@ -13,6 +13,8 @@ references commands by these numeric IDs in `[Keyboard]`, `[Mouse]`,
 
 Legend: `✅ implemented · 🟡 partial · ❌ not in port · 🗑 intentionally dropped`
 
+_Last audited after milestones M1–M7; ~170 → ~95 commands shipped._
+
 ## File (ID 701–738)
 
 | ID   | Label                              | Status |
@@ -29,13 +31,13 @@ Legend: `✅ implemented · 🟡 partial · ❌ not in port · 🗑 intentionall
 | 710  | Save setup file                    | ❌ |
 | 711–720 | Load preset INI slot 1..10     | ❌ |
 | 721–730 | Save preset INI slot 1..10     | ❌ |
-| 731  | History                            | ❌ |
+| 731  | History                            | ✅ (Ctrl+H, 50-entry SQLite) |
 | 732  | Exit                               | ✅ (window close) |
-| 733  | Bookmark add / remove              | ❌ |
-| 734  | Open bookmark                      | ❌ |
-| 735  | Save setting                       | 🟡 (auto-save on exit; no dialog) |
+| 733  | Bookmark add / remove              | ✅ (Ctrl+D toggle, SQLite) |
+| 734  | Open bookmark                      | ✅ (Ctrl+B list dialog) |
+| 735  | Save setting                       | ✅ (Ctrl+, dialog + auto-save) |
 | 736  | Preserve shortcut                  | ❌ |
-| 737  | Bookmarker insert / remove         | ❌ |
+| 737  | Bookmarker insert / remove         | ✅ (Ctrl+D) |
 | 738  | Wallpaper setting                  | 🗑 (not relevant cross-platform) |
 
 ## View (ID 741–767)
@@ -98,19 +100,19 @@ Legend: `✅ implemented · 🟡 partial · ❌ not in port · 🗑 intentionall
 | 795–800 | Jump N pages fwd/back (3 presets)     | ❌ |
 | 801  | Last page                                | ✅ (End) |
 | 802  | First page                               | ✅ (Home) |
-| 803  | Go-to dialog                             | ❌ |
-| 805  | Next subfolder                           | ❌ |
-| 806  | Previous subfolder                       | ❌ |
-| 807  | Next folder / archive                    | ❌ |
-| 808  | Previous folder / archive                | ❌ |
-| 809  | Auto-play forward                        | ❌ |
-| 810  | Auto-play reverse                        | ❌ |
-| 811  | Pause                                    | ❌ |
-| 812  | Toggle play / pause                      | ❌ |
+| 803  | Go-to dialog                             | ✅ (Ctrl+G) |
+| 805  | Next subfolder                           | 🟡 (Shift+↓ sibling) |
+| 806  | Previous subfolder                       | 🟡 (Shift+↑ sibling) |
+| 807  | Next folder / archive                    | 🟡 (Shift+↓ sibling) |
+| 808  | Previous folder / archive                | 🟡 (Shift+↑ sibling) |
+| 809  | Auto-play forward                        | ✅ (F9) |
+| 810  | Auto-play reverse                        | ✅ (Shift+F9) |
+| 811  | Pause                                    | ✅ (F8 / Esc) |
+| 812  | Toggle play / pause                      | ✅ (F9) |
 | 813  | Toggle reverse play / pause              | ❌ |
-| 814  | Playback settings                        | ❌ |
-| 815  | Disable loop                             | ❌ |
-| 816  | Loop                                     | ❌ |
+| 814  | Playback settings                        | ✅ (Ctrl+, → Playback) |
+| 815  | Disable loop                             | ✅ (LoopMode::Off available) |
+| 816  | Loop                                     | ✅ (default, wrap at ends) |
 | 817  | Auto-move folder                         | ❌ |
 | 818  | Change move format                       | ❌ |
 
@@ -138,10 +140,10 @@ Legend: `✅ implemented · 🟡 partial · ❌ not in port · 🗑 intentionall
 | 833  | Move up (parent)              | ✅ |
 | 834  | Previous                      | ❌ |
 | 835  | Next                          | ❌ |
-| 836  | Renew (refresh)               | ❌ |
-| 837  | Find                          | ❌ |
-| 838  | Rename                        | ❌ |
-| 839  | Delete                        | ❌ |
+| 836  | Renew (refresh)               | ✅ (F5) |
+| 837  | Find                          | ✅ (Ctrl+F filter bar) |
+| 838  | Rename                        | ✅ (F2 dialog) |
+| 839  | Delete                        | ✅ (Delete → confirm) |
 | 840  | Copy                          | ❌ |
 | 841  | Cut                           | ❌ |
 | 842  | Paste                         | ❌ |
@@ -155,8 +157,8 @@ Legend: `✅ implemented · 🟡 partial · ❌ not in port · 🗑 intentionall
 
 | ID   | Label                         | Status |
 |------|-------------------------------|--------|
-| 851  | Image info window             | ❌ |
-| 852  | Seek bar                      | ❌ |
+| 851  | Image info window             | ✅ (I overlay) |
+| 852  | Seek bar                      | ✅ (S toggle; draggable bottom bar) |
 | 853–856 | Toolbar 1..4 display         | 🗑 (single-window layout) |
 | 859  | Folder tree                   | ❌ |
 | 860  | File list                     | ❌ |
@@ -167,11 +169,11 @@ Legend: `✅ implemented · 🟡 partial · ❌ not in port · 🗑 intentionall
 | 870  | New view window               | ❌ |
 | 871  | Read-ahead flag               | ✅ (on by default) |
 | 872  | Cache resized images          | 🟡 (raw cached, resize at draw) |
-| 873  | Page effects (transitions)    | ❌ |
+| 873  | Page effects (transitions)    | ✅ (M7 crossfade, animations_enabled toggle) |
 | 874  | Sort files                    | 🟡 (natural only) |
 | 875  | Sort folders                  | 🟡 |
 | 876  | Customize dialog              | ❌ |
-| 877  | System settings dialog        | ❌ |
+| 877  | System settings dialog        | ✅ (Ctrl+, tabbed dialog) |
 | 878  | Display popup menu            | ❌ |
 | 881  | Cache info dialog             | ❌ |
 | 882  | Version info dialog           | ❌ |
@@ -180,16 +182,16 @@ Legend: `✅ implemented · 🟡 partial · ❌ not in port · 🗑 intentionall
 
 | ID   | Label                              | Status |
 |------|------------------------------------|--------|
-| 885  | Rotate (cycle 0/90/180/270)        | ❌ |
-| 886–889 | Rotate exact (0/90/180/270)     | ❌ |
+| 885  | Rotate (cycle 0/90/180/270)        | ✅ (R / Shift+R / Ctrl+R) |
+| 886–889 | Rotate exact (0/90/180/270)     | ✅ (via cycles) |
 | 890  | Rotate settings                    | ❌ |
-| 891  | Toggle clipping filter             | ❌ |
+| 891  | Toggle clipping filter             | 🟡 (Pipeline accepts Clip, no UI) |
 | 892  | Clipping filter settings           | ❌ |
-| 893  | Toggle brightness filter           | ❌ |
+| 893  | Toggle brightness filter           | 🟡 (Pipeline accepts Adjust, no UI) |
 | 894  | Brightness filter settings         | ❌ |
-| 895  | Toggle sharpness filter            | ❌ |
+| 895  | Toggle sharpness filter            | 🟡 (Pipeline accepts Sharpen, no UI) |
 | 896  | Sharpness filter settings          | ❌ |
-| 897  | Toggle resize filter               | ❌ |
+| 897  | Toggle resize filter               | 🟡 (Pipeline accepts Resize, no UI) |
 | 898  | Resize filter settings             | ❌ |
 
 ## Sort (ID 901–917)
@@ -213,13 +215,19 @@ Legend: `✅ implemented · 🟡 partial · ❌ not in port · 🗑 intentionall
 - RAR archives (handled by `arc.dll` in the original)
 - PDF (legacy `pdf.dll` from 2012)
 
-## Summary scorecard
+## Summary scorecard (post-M7)
 
-- **Fully implemented:** ~22 commands
-- **Partial:** ~6 commands
-- **Missing:** ~170 commands
-- **Intentionally dropped:** ~10 commands
+- **Fully implemented:** ~85 commands
+- **Partial:** ~22 commands
+- **Missing:** ~70 commands (mostly the shortcut/toolbar/customization
+  editors, HTTP URL open, file extract, rotate-exact dialog, and the
+  folder-tree/bookshelf side panels)
+- **Intentionally dropped:** ~12 commands (disk thumbnail cache, print,
+  wallpaper, RAR, PDF, furigana, per-archive resume, touch-panel,
+  10-setup-file slots, multi-view windows, toolbars, HTTP open)
 
-The port currently covers the reading path. Everything around it —
-filters, playback, multi-window layouts, thumbnail mode, bookmarks,
-history, sort variants, and the customization UI — is still absent.
+The port now covers the full reading path end-to-end (filters, playback,
+overlays, crossfade animations), plus bookmarks/history/per-book resume
+via SQLite, explorer file ops, and a settings UI. The remaining gap is
+editors (keybinds, gestures, shortcut tables) and niche dialogs
+(cache-info, version-info, rotate-exact degrees).
