@@ -1064,11 +1064,79 @@ fn default_store_path() -> PathBuf {
 fn open_store_or_warn() -> Option<mmce_store::Store> {
     let path = default_store_path();
     match mmce_store::Store::open(&path) {
-        Ok(s) => Some(s),
+        Ok(s) => {
+            // One-shot import of a legacy MangaMeeyaCE.ini sitting next to
+            // our config, so existing users land on a familiar setup.
+            import_legacy_ini_once(&s);
+            Some(s)
+        }
         Err(e) => {
             log::warn!("state.db unavailable ({e}); falling back to in-memory");
             mmce_store::Store::open_memory().ok()
         }
+    }
+}
+
+/// If we haven't yet imported the legacy INI into SQLite, look for a
+/// `MangaMeeyaCE.ini` alongside our `mmce.ini`, parse it, and copy a
+/// small whitelist of keys into the `setting` table. Marks the import as
+/// done so we don't touch the user's legacy file again.
+fn import_legacy_ini_once(store: &mmce_store::Store) {
+    match store.get_setting("legacy_ini_imported") {
+        Ok(Some(_)) => return,
+        Err(e) => {
+            log::warn!("legacy-ini import: settings read failed: {e}");
+            return;
+        }
+        Ok(None) => {}
+    }
+
+    // Try both the canonical XDG location and the fallback cwd.
+    let candidates = [
+        default_settings_path()
+            .parent()
+            .map(|p| p.join("MangaMeeyaCE.ini")),
+        Some(PathBuf::from("MangaMeeyaCE.ini")),
+    ];
+
+    let mut imported = 0usize;
+    for candidate in candidates.into_iter().flatten() {
+        if !candidate.exists() {
+            continue;
+        }
+        if let Ok(settings) = mmce_config::Settings::load(&candidate) {
+            // Mirror the keys we can express as plain setting rows. The
+            // structured sections are already loaded through the normal
+            // Settings path; this is purely so a fresh user's
+            // preferences survive if they blow away mmce.ini later.
+            let rot = match settings.view.page_mode {
+                mmce_config::PageMode::Single => "single",
+                mmce_config::PageMode::Spread => "spread",
+                mmce_config::PageMode::Auto => "auto",
+            };
+            let _ = store.set_setting("legacy.page_mode", rot);
+            let _ = store.set_setting(
+                "legacy.bind_dir",
+                match settings.view.bind_dir {
+                    mmce_config::BindDir::LeftToRight => "ltr",
+                    mmce_config::BindDir::RightToLeft => "rtl",
+                },
+            );
+            let _ = store.set_setting(
+                "legacy.bg_color",
+                &settings.general.bg_color.to_string(),
+            );
+            imported += 1;
+            break;
+        }
+    }
+
+    let _ = store.set_setting(
+        "legacy_ini_imported",
+        if imported > 0 { "1" } else { "0" },
+    );
+    if imported > 0 {
+        log::info!("imported legacy MangaMeeyaCE.ini into state.db");
     }
 }
 
