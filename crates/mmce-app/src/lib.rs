@@ -830,22 +830,21 @@ impl eframe::App for App {
                                 && !book_page_rects.is_empty()
                                 && self.last_book_paint.len() == book_page_rects.len()
                             {
-                                let next_paint: Vec<PagePaint> = book_page_rects
+                                let next_raw: Vec<PagePaint> = book_page_rects
                                     .iter()
-                                    .map(|(_, tex, rect)| PagePaint {
-                                        tex: tex.clone(),
-                                        rect: *rect,
+                                    .map(|(_, tex, rect)| {
+                                        PagePaint::full(tex.clone(), *rect)
                                     })
                                     .collect();
+                                let (prev_pair, next_pair) =
+                                    normalise_pair(&self.last_book_paint, &next_raw);
                                 self.flip = Some(PageFlip::new(
-                                    self.last_book_paint.clone(),
-                                    next_paint,
+                                    prev_pair,
+                                    next_pair,
                                     self.viewer.bind_dir,
                                     dir,
                                 ));
                             } else {
-                                // Mismatched structure (e.g. Auto mode
-                                // crossing single/spread) — skip the flip.
                                 self.flip = None;
                             }
                         }
@@ -892,10 +891,7 @@ impl eframe::App for App {
         // the flip is active, and drop it when it completes.
         self.last_book_paint = book_page_rects
             .iter()
-            .map(|(_, tex, rect)| PagePaint {
-                tex: tex.clone(),
-                rect: *rect,
-            })
+            .map(|(_, tex, rect)| PagePaint::full(tex.clone(), *rect))
             .collect();
         if let Some(b) = self.book.as_ref() {
             self.last_book_cursor = Some(b.cursor());
@@ -1073,6 +1069,29 @@ fn draw_spread(
         rects.push((idx, tex, rect));
     }
     rects
+}
+
+/// Build the `[left, right]` pair the flip animator wants out of the
+/// raw page rects of the previous and current frames. For spread mode
+/// it's a pass-through; for single-page mode we split each page at its
+/// rendered horizontal centre so the flip folds at the middle — even
+/// when displaying a single image like a real book leaf would.
+fn normalise_pair(
+    prev: &[PagePaint],
+    next: &[PagePaint],
+) -> (Vec<PagePaint>, Vec<PagePaint>) {
+    match (prev.len(), next.len()) {
+        (1, 1) => {
+            // Use the union center so both prev/next fold at the same
+            // x-coordinate. This keeps the seam steady when prev and
+            // next happen to render at slightly different widths.
+            let cx = 0.5 * (prev[0].rect.center().x + next[0].rect.center().x);
+            let (pl, pr) = prev[0].clone().split_at(cx);
+            let (nl, nr) = next[0].clone().split_at(cx);
+            (vec![pl, pr], vec![nl, nr])
+        }
+        _ => (prev.to_vec(), next.to_vec()),
+    }
 }
 
 fn default_settings_path() -> PathBuf {
