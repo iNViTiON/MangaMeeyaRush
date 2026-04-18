@@ -3,8 +3,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use egui::{CentralPanel, Color32, Context, Vec2, ViewportCommand};
+use egui::{CentralPanel, Color32, Context, CursorIcon, Pos2, Vec2, ViewportCommand};
 use mmce_codecs::{folder_has_direct_images, is_archive_path, PageSource};
 use mmce_config::{FitMode, PageMode, Settings};
 use mmce_core::{stride, Book, Spread, ViewerState};
@@ -80,6 +81,10 @@ pub struct App {
     last_book_cursor: Option<usize>,
     flip: Option<PageFlip>,
     pub(crate) animations_enabled: bool,
+    /// Most recently observed pointer position, used to decide when the
+    /// cursor is idle and the seek bar hover-zone check.
+    last_pointer_pos: Option<Pos2>,
+    last_pointer_move: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +196,8 @@ impl App {
             last_book_cursor: None,
             flip: None,
             animations_enabled: true,
+            last_pointer_pos: None,
+            last_pointer_move: Instant::now(),
         };
 
         if let Some(p) = start_path {
@@ -779,30 +786,17 @@ impl eframe::App for App {
         );
 
         let mut clicked: Option<Entry> = None;
+        let mut seek_requested: Option<usize> = None;
         let effective = self.effective_mode();
 
-        // Optional seek bar lives above the status bar so it's always
-        // visible below the central panel in Book view.
-        let mut seek_target: Option<usize> = None;
-        if matches!(self.view, View::Book)
-            && self.overlays.seekbar
-            && self.book.as_ref().map(|b| b.len() > 1).unwrap_or(false)
-        {
-            egui::TopBottomPanel::bottom("seekbar")
-                .show_separator_line(false)
-                .frame(
-                    egui::Frame::none()
-                        .fill(Color32::from_black_alpha(120))
-                        .inner_margin(egui::Margin::symmetric(10.0, 4.0)),
-                )
-                .show(ctx, |ui| {
-                    if let Some(book) = self.book.as_ref() {
-                        seek_target = overlay::seek_bar(ui, book);
-                    }
-                });
-        }
-        if let Some(idx) = seek_target {
-            self.goto_page(idx);
+        // Pointer activity tracking — drives idle cursor hiding and the
+        // hover-activated seek bar below.
+        let now = Instant::now();
+        if let Some(pos) = ctx.pointer_latest_pos() {
+            if self.last_pointer_pos != Some(pos) {
+                self.last_pointer_pos = Some(pos);
+                self.last_pointer_move = now;
+            }
         }
 
         // Detect cursor changes + direction so we can kick off a page
@@ -885,6 +879,26 @@ impl eframe::App for App {
                                 );
                             }
                         }
+
+                        // Hover-activated seek bar. Lives entirely inside
+                        // the central panel so the image never shrinks
+                        // to accommodate it.
+                        if self.overlays.seekbar && book.len() > 1 {
+                            let ptr_in_zone = ui
+                                .ctx()
+                                .pointer_latest_pos()
+                                .map(|p| {
+                                    p.y >= ui.max_rect().max.y - SEEK_BAR_ACTIVATION_ZONE
+                                        && ui.max_rect().x_range().contains(p.x)
+                                })
+                                .unwrap_or(false);
+                            if ptr_in_zone {
+                                if let Some(idx) = paint_seekbar_overlay(ui, book) {
+                                    seek_requested = Some(idx);
+                                }
+                            }
+                        }
+
                         let window: Vec<usize> = spread.indices().collect();
                         if self.settings.cache.preload {
                             cache.prefetch(&window, 2);
@@ -901,6 +915,35 @@ impl eframe::App for App {
 
         if let Some(entry) = clicked {
             self.handle_explorer_click(ctx, entry);
+        }
+        if let Some(idx) = seek_requested {
+            self.goto_page(idx);
+        }
+
+        // Idle cursor hiding — keeps the book view cinematic. Active
+        // only when the pointer hasn't moved for `POINTER_IDLE_TIMEOUT`
+        // and the user isn't hovering over the seek-bar zone (so a
+        // parked mouse doesn't lose its pointer just before clicking
+        // the bar).
+        if matches!(self.view, View::Book) {
+            let idle = now.duration_since(self.last_pointer_move);
+            let in_bar_zone = self
+                .last_pointer_pos
+                .map(|p| {
+                    p.y >= ctx.screen_rect().max.y - SEEK_BAR_ACTIVATION_ZONE
+                })
+                .unwrap_or(false);
+            if idle >= POINTER_IDLE_TIMEOUT && !in_bar_zone {
+                ctx.set_cursor_icon(CursorIcon::None);
+            } else {
+                // Schedule a repaint when we should re-evaluate the
+                // idle state, so the cursor actually disappears without
+                // needing any input.
+                if idle < POINTER_IDLE_TIMEOUT {
+                    let remaining = POINTER_IDLE_TIMEOUT - idle + Duration::from_millis(50);
+                    ctx.request_repaint_after(remaining);
+                }
+            }
         }
 
         // Remember the rects we just painted so the next cursor change
@@ -1129,6 +1172,44 @@ fn normalise_pair(
         }
         _ => (prev.to_vec(), next.to_vec()),
     }
+}
+
+/// Height in logical px of the bottom strip that activates the seek bar
+/// on hover. Roomy enough to reach with a quick flick from anywhere on
+/// screen without requiring pixel-perfect aim.
+const SEEK_BAR_ACTIVATION_ZONE: f32 = 110.0;
+
+/// How long the pointer must stay still before we hide it in Book view.
+const POINTER_IDLE_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// Paint a semi-transparent seek bar over the bottom of the central
+/// panel and return the target page index if the user clicked/dragged
+/// to a new spot.
+fn paint_seekbar_overlay(
+    ui: &mut egui::Ui,
+    book: &Book,
+) -> Option<usize> {
+    let viewport = ui.max_rect();
+    let bar_h = 28.0;
+    let side_pad = 16.0;
+    let bottom_pad = 6.0;
+    let bar_rect = egui::Rect::from_min_size(
+        egui::Pos2::new(
+            viewport.min.x + side_pad,
+            viewport.max.y - bar_h - bottom_pad,
+        ),
+        Vec2::new(viewport.width() - 2.0 * side_pad, bar_h),
+    );
+    ui.painter()
+        .rect_filled(bar_rect, 6.0, Color32::from_black_alpha(170));
+    let mut result: Option<usize> = None;
+    ui.allocate_new_ui(
+        egui::UiBuilder::new().max_rect(bar_rect.shrink2(Vec2::new(8.0, 3.0))),
+        |ui| {
+            result = overlay::seek_bar(ui, book);
+        },
+    );
+    result
 }
 
 fn default_settings_path() -> PathBuf {
