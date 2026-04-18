@@ -13,6 +13,7 @@ use mmce_render::{compute_size, PageCache};
 
 mod explorer;
 mod input;
+mod overlay;
 mod thumbs;
 
 use explorer::{Entry, EntryKind, ExplorerState};
@@ -42,6 +43,29 @@ pub struct App {
     pub(crate) current_path: Option<PathBuf>,
     pub(crate) view: View,
     pub(crate) explorer: Option<ExplorerState>,
+    /// Toggleable overlays / HUD elements.
+    pub(crate) overlays: Overlays,
+}
+
+#[derive(Debug, Clone)]
+pub struct Overlays {
+    pub info: bool,
+    pub loupe: bool,
+    pub seekbar: bool,
+    pub loupe_radius: f32,
+    pub loupe_magnification: f32,
+}
+
+impl Default for Overlays {
+    fn default() -> Self {
+        Self {
+            info: false,
+            loupe: false,
+            seekbar: true,
+            loupe_radius: 120.0,
+            loupe_magnification: 3.0,
+        }
+    }
 }
 
 /// High-level knobs the user actually touches. Serialized separately from
@@ -116,6 +140,7 @@ impl App {
             current_path: None,
             view,
             explorer: None,
+            overlays: Overlays::default(),
         };
 
         if let Some(p) = start_path {
@@ -347,6 +372,24 @@ impl App {
         }
     }
 
+    pub(crate) fn toggle_info_overlay(&mut self) {
+        self.overlays.info = !self.overlays.info;
+    }
+
+    pub(crate) fn toggle_loupe(&mut self) {
+        self.overlays.loupe = !self.overlays.loupe;
+    }
+
+    pub(crate) fn toggle_seekbar(&mut self) {
+        self.overlays.seekbar = !self.overlays.seekbar;
+    }
+
+    pub(crate) fn goto_page(&mut self, idx: usize) {
+        if let Some(b) = self.book.as_mut() {
+            b.goto(idx);
+        }
+    }
+
     /// The directory whose *siblings* Shift+Up/Down should walk. In Book
     /// view that's the book's containing folder (or the archive file
     /// itself, or the dir holding a loose image). In Explorer view it's
@@ -467,19 +510,59 @@ impl eframe::App for App {
         let mut clicked: Option<Entry> = None;
         let effective = self.effective_mode();
 
+        // Optional seek bar lives above the status bar so it's always
+        // visible below the central panel in Book view.
+        let mut seek_target: Option<usize> = None;
+        if matches!(self.view, View::Book)
+            && self.overlays.seekbar
+            && self.book.as_ref().map(|b| b.len() > 1).unwrap_or(false)
+        {
+            egui::TopBottomPanel::bottom("seekbar")
+                .show_separator_line(false)
+                .frame(
+                    egui::Frame::none()
+                        .fill(Color32::from_black_alpha(120))
+                        .inner_margin(egui::Margin::symmetric(10.0, 4.0)),
+                )
+                .show(ctx, |ui| {
+                    if let Some(book) = self.book.as_ref() {
+                        seek_target = overlay::seek_bar(ui, book);
+                    }
+                });
+        }
+        if let Some(idx) = seek_target {
+            self.goto_page(idx);
+        }
+
+        let mut book_page_rects: Vec<(usize, egui::TextureHandle, egui::Rect)> = Vec::new();
+
         CentralPanel::default()
             .frame(egui::Frame::none().fill(bg_book))
             .show(ctx, |ui| match self.view {
                 View::Book => match (self.book.as_ref(), self.cache.as_ref()) {
                     (Some(book), Some(cache)) if book.len() > 0 => {
                         let spread = book.current_spread(effective, self.viewer.bind_dir);
-                        draw_spread(
+                        book_page_rects = draw_spread(
                             ui,
                             spread,
                             cache,
                             &self.viewer,
                             self.settings.scale.no_zoom_in,
                         );
+                        if self.overlays.info {
+                            overlay::paint_info(ui, book, cache, spread);
+                        }
+                        if self.overlays.loupe {
+                            if let Some(cursor) = ui.ctx().pointer_latest_pos() {
+                                overlay::paint_loupe(
+                                    ui,
+                                    cursor,
+                                    &book_page_rects,
+                                    self.overlays.loupe_magnification,
+                                    self.overlays.loupe_radius,
+                                );
+                            }
+                        }
                         let window: Vec<usize> = spread.indices().collect();
                         if self.settings.cache.preload {
                             cache.prefetch(&window, 2);
@@ -604,13 +687,15 @@ fn draw_welcome(ui: &mut egui::Ui, err: Option<&str>) {
     });
 }
 
+/// Returns the page rects the spread was painted into (for overlays such as
+/// the loupe that need to reverse-map screen pixels to source pixels).
 fn draw_spread(
     ui: &mut egui::Ui,
     spread: Spread,
     cache: &PageCache,
     viewer: &ViewerState,
     no_zoom_in_cfg: bool,
-) {
+) -> Vec<(usize, egui::TextureHandle, egui::Rect)> {
     let viewport = ui.available_size();
 
     let pages: Vec<(usize, egui::TextureHandle)> = spread
@@ -622,7 +707,7 @@ fn draw_spread(
         ui.centered_and_justified(|ui| {
             ui.spinner();
         });
-        return;
+        return Vec::new();
     }
 
     let intrinsic: Vec2 = pages.iter().fold(Vec2::ZERO, |acc, (_, t)| {
@@ -641,7 +726,7 @@ fn draw_spread(
         no_zoom_in_cfg && viewer.fit != FitMode::Custom,
     );
     if rendered.x <= 0.0 || rendered.y <= 0.0 {
-        return;
+        return Vec::new();
     }
     let scale = rendered.x / intrinsic.x;
 
@@ -649,15 +734,18 @@ fn draw_spread(
     let top_left = ui.min_rect().left_top() + offset;
 
     let mut cursor_x = top_left.x;
-    for (_, tex) in &pages {
+    let mut rects = Vec::with_capacity(pages.len());
+    for (idx, tex) in pages {
         let s = tex.size_vec2() * scale;
         let y = top_left.y + (rendered.y - s.y) * 0.5;
         let rect = egui::Rect::from_min_size(egui::pos2(cursor_x, y), s);
-        egui::Image::from_texture(tex)
+        egui::Image::from_texture(&tex)
             .fit_to_exact_size(s)
             .paint_at(ui, rect);
         cursor_x += s.x;
+        rects.push((idx, tex, rect));
     }
+    rects
 }
 
 fn default_settings_path() -> PathBuf {

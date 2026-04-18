@@ -181,6 +181,12 @@ fn dispatch_key(app: &mut App, ctx: &Context, key: Key, mods: Modifiers) {
         // rotation" command).
         Key::R if cmd_only => app.reset_filters(),
 
+        // Overlays.
+        Key::I if plain => app.toggle_info_overlay(),
+        Key::L if plain => app.toggle_loupe(),
+        // Hide the seek bar for an immersive reading view.
+        Key::S if plain => app.toggle_seekbar(),
+
         // File ops.
         Key::O if plain || cmd_only => app.open_dialog(ctx),
         Key::O if shift_only => app.open_folder_dialog(ctx),
