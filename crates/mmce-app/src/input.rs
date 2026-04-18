@@ -198,6 +198,11 @@ fn dispatch_key(app: &mut App, ctx: &Context, key: Key, mods: Modifiers) {
         Key::F9 if shift_only => app.start_playback(false),
         Key::F8 if plain => app.stop_playback(),
 
+        // Bookmarks + history.
+        Key::D if cmd_only => app.toggle_bookmark(),
+        Key::B if cmd_only => app.open_bookmarks_dialog(),
+        Key::H if cmd_only => app.open_history_dialog(),
+
         // File ops.
         Key::O if plain || cmd_only => app.open_dialog(ctx),
         Key::O if shift_only => app.open_folder_dialog(ctx),

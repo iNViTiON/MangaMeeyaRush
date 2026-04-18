@@ -23,3 +23,4 @@ mmce-codecs = { path = "../mmce-codecs" }
 mmce-config = { path = "../mmce-config" }
 mmce-render = { path = "../mmce-render" }
 mmce-filters = { path = "../mmce-filters" }
+mmce-store = { path = "../mmce-store" }

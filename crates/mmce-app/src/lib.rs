@@ -11,14 +11,18 @@ use mmce_core::{stride, Book, Spread, ViewerState};
 use mmce_filters::{FilterOp, Pipeline, Rotation};
 use mmce_render::{compute_size, PageCache};
 
+mod bookmarks;
 mod dialogs;
 mod explorer;
+mod history;
 mod input;
 mod overlay;
 mod playback;
 mod thumbs;
 
+use bookmarks::BookmarksDialog;
 use dialogs::GotoDialog;
+use history::HistoryDialog;
 use playback::Playback;
 
 use explorer::{Entry, EntryKind, ExplorerState};
@@ -52,6 +56,14 @@ pub struct App {
     pub(crate) overlays: Overlays,
     pub(crate) playback: Playback,
     pub(crate) goto: GotoDialog,
+    pub(crate) bookmarks: BookmarksDialog,
+    pub(crate) history: HistoryDialog,
+    /// Persistent store for history, bookmarks, and per-book state.
+    /// `None` when the DB couldn't open (rare; we fall back to in-memory).
+    pub(crate) store: Option<mmce_store::Store>,
+    /// ID of the currently-open book in the store, if any. Used to attach
+    /// bookmarks and record reading progress.
+    pub(crate) current_book_id: Option<mmce_store::BookId>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +147,8 @@ impl App {
             _ => View::Book,
         };
 
+        let store = open_store_or_warn();
+
         let mut app = Self {
             settings,
             settings_path,
@@ -150,6 +164,10 @@ impl App {
             overlays: Overlays::default(),
             playback: Playback::default(),
             goto: GotoDialog::default(),
+            bookmarks: BookmarksDialog::default(),
+            history: HistoryDialog::default(),
+            store,
+            current_book_id: None,
         };
 
         if let Some(p) = start_path {
@@ -218,6 +236,7 @@ impl App {
                 if pages > 0 {
                     self.view = View::Book;
                 }
+                self.attach_store_book(path, pages);
             }
             Err(e) => {
                 self.last_error = Some(format!("open {}: {}", path.display(), e));
@@ -416,6 +435,91 @@ impl App {
         self.playback.pause();
     }
 
+    // ---------- store integration --------------------------------------
+
+    fn attach_store_book(&mut self, path: &Path, page_count: usize) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let path_str = canon.to_string_lossy().to_string();
+        let kind = classify_path(&canon);
+        match store.upsert_book(&path_str, kind) {
+            Ok(id) => {
+                // Restore last read page if sensible.
+                if let Ok(Some(row)) = store.get_book_by_path(&path_str) {
+                    let last = row.last_page as usize;
+                    if last > 0 && last < page_count {
+                        if let Some(b) = self.book.as_mut() {
+                            b.goto(last);
+                        }
+                    }
+                }
+                self.current_book_id = Some(id);
+            }
+            Err(e) => {
+                log::warn!("store upsert_book: {e}");
+            }
+        }
+    }
+
+    /// Persist current reading position. Called on navigation and on exit.
+    fn touch_store_position(&self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let Some(id) = self.current_book_id else {
+            return;
+        };
+        let Some(book) = self.book.as_ref() else {
+            return;
+        };
+        if let Err(e) = store.touch_book(id, book.cursor(), book.len()) {
+            log::warn!("store touch_book: {e}");
+        }
+    }
+
+    pub(crate) fn toggle_bookmark(&mut self) {
+        let (Some(store), Some(id), Some(book)) =
+            (self.store.as_ref(), self.current_book_id, self.book.as_ref())
+        else {
+            return;
+        };
+        let page = book.cursor();
+        match store.list_bookmarks(id) {
+            Ok(rows) => {
+                if rows.iter().any(|r| r.page == page as i64) {
+                    let _ = store.remove_bookmark(id, page);
+                    self.status = format!("Removed bookmark at page {}", page + 1);
+                } else {
+                    let label = book
+                        .source()
+                        .entry_name(page)
+                        .map(|s| s.to_string());
+                    let _ = store.add_bookmark(id, page, label.as_deref());
+                    self.status = format!("Bookmarked page {}", page + 1);
+                }
+            }
+            Err(e) => log::warn!("list_bookmarks: {e}"),
+        }
+    }
+
+    pub(crate) fn open_bookmarks_dialog(&mut self) {
+        if let (Some(store), Some(id)) = (self.store.as_ref(), self.current_book_id) {
+            if let Ok(rows) = store.list_bookmarks(id) {
+                self.bookmarks.open(rows);
+            }
+        }
+    }
+
+    pub(crate) fn open_history_dialog(&mut self) {
+        if let Some(store) = self.store.as_ref() {
+            if let Ok(rows) = store.recent_books(50) {
+                self.history.open(rows);
+            }
+        }
+    }
+
     /// The directory whose *siblings* Shift+Up/Down should walk. In Book
     /// view that's the book's containing folder (or the archive file
     /// itself, or the dir holding a loose image). In Explorer view it's
@@ -545,6 +649,14 @@ impl eframe::App for App {
             if let Some(idx) = self.goto.show(ctx, total) {
                 self.goto_page(idx);
             }
+        }
+
+        // Bookmarks + history dialogs.
+        if let Some(page) = self.bookmarks.show(ctx) {
+            self.goto_page(page);
+        }
+        if let Some(path) = self.history.show(ctx) {
+            self.open_path(ctx, &path);
         }
 
         let bg_book = egui::Color32::from_rgb(
@@ -706,6 +818,7 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_settings();
+        self.touch_store_position();
     }
 }
 
@@ -799,6 +912,42 @@ fn default_settings_path() -> PathBuf {
         dirs.join("mmce").join("mmce.ini")
     } else {
         PathBuf::from("mmce.ini")
+    }
+}
+
+fn default_store_path() -> PathBuf {
+    if let Some(dirs) = dirs_config() {
+        dirs.join("mmce").join("state.db")
+    } else {
+        PathBuf::from("state.db")
+    }
+}
+
+fn open_store_or_warn() -> Option<mmce_store::Store> {
+    let path = default_store_path();
+    match mmce_store::Store::open(&path) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            log::warn!("state.db unavailable ({e}); falling back to in-memory");
+            mmce_store::Store::open_memory().ok()
+        }
+    }
+}
+
+fn classify_path(path: &Path) -> &'static str {
+    if path.is_dir() {
+        "folder"
+    } else {
+        match path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("zip" | "cbz") => "zip",
+            Some("7z" | "cb7") => "sevenz",
+            _ => "image",
+        }
     }
 }
 

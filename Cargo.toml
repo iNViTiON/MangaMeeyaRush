@@ -6,6 +6,7 @@ members = [
     "crates/mmce-core",
     "crates/mmce-filters",
     "crates/mmce-render",
+    "crates/mmce-store",
     "crates/mmce-app",
 ]
 
@@ -42,6 +43,9 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "t
 
 # INI
 encoding_rs = "0.8"
+
+# Persistence
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [profile.release]
 lto = "thin"

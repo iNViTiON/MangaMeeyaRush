@@ -1,0 +1,13 @@
+[package]
+name = "mmce-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
