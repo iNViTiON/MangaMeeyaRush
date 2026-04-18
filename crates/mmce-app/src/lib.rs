@@ -11,10 +11,15 @@ use mmce_core::{stride, Book, Spread, ViewerState};
 use mmce_filters::{FilterOp, Pipeline, Rotation};
 use mmce_render::{compute_size, PageCache};
 
+mod dialogs;
 mod explorer;
 mod input;
 mod overlay;
+mod playback;
 mod thumbs;
+
+use dialogs::GotoDialog;
+use playback::Playback;
 
 use explorer::{Entry, EntryKind, ExplorerState};
 
@@ -45,6 +50,8 @@ pub struct App {
     pub(crate) explorer: Option<ExplorerState>,
     /// Toggleable overlays / HUD elements.
     pub(crate) overlays: Overlays,
+    pub(crate) playback: Playback,
+    pub(crate) goto: GotoDialog,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +148,8 @@ impl App {
             view,
             explorer: None,
             overlays: Overlays::default(),
+            playback: Playback::default(),
+            goto: GotoDialog::default(),
         };
 
         if let Some(p) = start_path {
@@ -390,6 +399,23 @@ impl App {
         }
     }
 
+    pub(crate) fn open_goto_dialog(&mut self) {
+        let cur = self.book.as_ref().map(|b| b.cursor() + 1).unwrap_or(1);
+        self.goto.open(cur);
+    }
+
+    pub(crate) fn toggle_playback(&mut self) {
+        self.playback.toggle();
+    }
+
+    pub(crate) fn start_playback(&mut self, forward: bool) {
+        self.playback.start(forward);
+    }
+
+    pub(crate) fn stop_playback(&mut self) {
+        self.playback.pause();
+    }
+
     /// The directory whose *siblings* Shift+Up/Down should walk. In Book
     /// view that's the book's containing folder (or the archive file
     /// itself, or the dir holding a loose image). In Explorer view it's
@@ -500,6 +526,26 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         input::handle(self, ctx);
+
+        // Slideshow tick. Runs before any painting so a delta applies to
+        // this frame's cursor.
+        if let Some(book) = self.book.as_ref() {
+            if let Some(delta) = self.playback.tick(book.cursor(), book.len()) {
+                if let Some(b) = self.book.as_mut() {
+                    b.advance(delta);
+                }
+            }
+            if let Some(after) = self.playback.repaint_after() {
+                ctx.request_repaint_after(after);
+            }
+        }
+
+        // Goto-page dialog.
+        if let Some(total) = self.book.as_ref().map(|b| b.len()) {
+            if let Some(idx) = self.goto.show(ctx, total) {
+                self.goto_page(idx);
+            }
+        }
 
         let bg_book = egui::Color32::from_rgb(
             (self.viewer.bg_color & 0xFF) as u8,

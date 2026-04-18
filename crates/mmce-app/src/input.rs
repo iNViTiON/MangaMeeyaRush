@@ -164,7 +164,12 @@ fn dispatch_key(app: &mut App, ctx: &Context, key: Key, mods: Modifiers) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(app.viewer.fullscreen));
         }
         Key::Escape => {
-            if app.viewer.fullscreen {
+            // Escape is the universal "stop what you're doing" key. It
+            // prioritises stopping an active slideshow, then exits
+            // fullscreen as a fallback.
+            if app.playback.is_playing() {
+                app.stop_playback();
+            } else if app.viewer.fullscreen {
                 app.viewer.fullscreen = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             }
@@ -186,6 +191,12 @@ fn dispatch_key(app: &mut App, ctx: &Context, key: Key, mods: Modifiers) {
         Key::L if plain => app.toggle_loupe(),
         // Hide the seek bar for an immersive reading view.
         Key::S if plain => app.toggle_seekbar(),
+
+        // Goto-page + slideshow.
+        Key::G if cmd_only => app.open_goto_dialog(),
+        Key::F9 if plain => app.toggle_playback(),
+        Key::F9 if shift_only => app.start_playback(false),
+        Key::F8 if plain => app.stop_playback(),
 
         // File ops.
         Key::O if plain || cmd_only => app.open_dialog(ctx),
