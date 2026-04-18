@@ -315,8 +315,25 @@ impl App {
     pub(crate) fn toggle_explorer(&mut self, ctx: &Context) {
         self.view = match self.view {
             View::Book => {
-                if self.explorer.is_none() {
-                    self.explorer = Some(ExplorerState::new(ctx, self.explorer_start_dir()));
+                // Always point the explorer at the current book's
+                // directory when opening from Book view — otherwise a
+                // stale ExplorerState (from, say, the initial launch or
+                // previous browsing) would strand the user one level up,
+                // making it impossible to descend into the book's own
+                // subfolders. Also try to pre-select the current book so
+                // it's obvious where they came from.
+                let dir = self.explorer_start_dir();
+                match self.explorer.as_mut() {
+                    Some(state) if state.current == dir => { /* already there */ }
+                    Some(state) => state.cd(dir),
+                    None => self.explorer = Some(ExplorerState::new(ctx, dir)),
+                }
+                if let (Some(state), Some(cur)) =
+                    (self.explorer.as_mut(), self.current_path.as_ref())
+                {
+                    if let Some(idx) = state.entries().iter().position(|e| &e.path == cur) {
+                        state.selection = idx;
+                    }
                 }
                 View::Explorer
             }
