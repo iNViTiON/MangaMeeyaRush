@@ -4,8 +4,16 @@ use anyhow::Result;
 use mmce_app::{App, CliArgs};
 
 fn main() -> Result<()> {
+    // Default: warn for everything, info for our own crates. Third-party
+    // libraries (zbus, calloop, winit, …) emit useful-to-them but
+    // noisy-to-us INFO lines during normal operation — we don't want
+    // those on stdout. Override with RUST_LOG=... to see more.
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
+        env_logger::Env::default().default_filter_or(
+            "warn,mmce_app=info,mmce_core=info,mmce_render=info,\
+             mmce_codecs=info,mmce_store=info,mmce_filters=info,\
+             mmce_config=info",
+        ),
     )
     .init();
 

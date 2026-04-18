@@ -22,6 +22,7 @@ pub enum State {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // `Off` is constructed from the settings UI via #update
 pub enum LoopMode {
     /// Stop at the last page.
     Off,

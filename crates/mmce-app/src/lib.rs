@@ -460,7 +460,7 @@ impl App {
 
     // ---------- store integration --------------------------------------
 
-    fn attach_store_book(&mut self, path: &Path, page_count: usize) {
+    fn attach_store_book(&mut self, path: &Path, _page_count: usize) {
         let Some(store) = self.store.as_ref() else {
             return;
         };
@@ -469,15 +469,9 @@ impl App {
         let kind = classify_path(&canon);
         match store.upsert_book(&path_str, kind) {
             Ok(id) => {
-                // Restore last read page if sensible.
-                if let Ok(Some(row)) = store.get_book_by_path(&path_str) {
-                    let last = row.last_page as usize;
-                    if last > 0 && last < page_count {
-                        if let Some(b) = self.book.as_mut() {
-                            b.goto(last);
-                        }
-                    }
-                }
+                // We deliberately DO NOT auto-jump to last_page on open —
+                // the user asked for explicit nav only. Bookmarks + the
+                // history dialog still exist for getting back to a spot.
                 self.current_book_id = Some(id);
             }
             Err(e) => {
@@ -486,7 +480,9 @@ impl App {
         }
     }
 
-    /// Persist current reading position. Called on navigation and on exit.
+    /// Record that the book was opened, and stamp the page count — but
+    /// deliberately leave `last_page` at 0 so we don't persist a reading
+    /// position between sessions. The user asked for explicit nav only.
     fn touch_store_position(&self) {
         let Some(store) = self.store.as_ref() else {
             return;
@@ -497,7 +493,7 @@ impl App {
         let Some(book) = self.book.as_ref() else {
             return;
         };
-        if let Err(e) = store.touch_book(id, book.cursor(), book.len()) {
+        if let Err(e) = store.touch_book(id, 0, book.len()) {
             log::warn!("store touch_book: {e}");
         }
     }
