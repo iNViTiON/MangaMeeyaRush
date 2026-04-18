@@ -20,7 +20,10 @@ mod history;
 mod input;
 mod overlay;
 mod playback;
+mod settings;
 mod thumbs;
+
+pub(crate) use settings::SettingsDialog;
 
 use anim::{PageFade, PagePaint};
 use bookmarks::BookmarksDialog;
@@ -64,6 +67,7 @@ pub struct App {
     pub(crate) history: HistoryDialog,
     pub(crate) confirm_delete: ConfirmDelete,
     pub(crate) rename: RenameDialog,
+    pub(crate) settings_dialog: SettingsDialog,
     /// Persistent store for history, bookmarks, and per-book state.
     /// `None` when the DB couldn't open (rare; we fall back to in-memory).
     pub(crate) store: Option<mmce_store::Store>,
@@ -180,6 +184,7 @@ impl App {
             history: HistoryDialog::default(),
             confirm_delete: ConfirmDelete::default(),
             rename: RenameDialog::default(),
+            settings_dialog: SettingsDialog::default(),
             store,
             current_book_id: None,
             last_book_paint: Vec::new(),
@@ -591,6 +596,10 @@ impl App {
         self.confirm_delete.open_for(path);
     }
 
+    pub(crate) fn open_settings_dialog(&mut self) {
+        self.settings_dialog.open_dialog();
+    }
+
     /// The directory whose *siblings* Shift+Up/Down should walk. In Book
     /// view that's the book's containing folder (or the archive file
     /// itself, or the dir holding a loose image). In Explorer view it's
@@ -747,6 +756,8 @@ impl eframe::App for App {
                 }
             }
         }
+
+        settings::show(ctx, self);
 
         let bg_book = egui::Color32::from_rgb(
             (self.viewer.bg_color & 0xFF) as u8,

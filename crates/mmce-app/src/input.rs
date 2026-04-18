@@ -212,6 +212,9 @@ fn dispatch_key(app: &mut App, ctx: &Context, key: Key, mods: Modifiers) {
         Key::B if cmd_only => app.open_bookmarks_dialog(),
         Key::H if cmd_only => app.open_history_dialog(),
 
+        // Settings dialog (Ctrl+,).
+        Key::Comma if cmd_only => app.open_settings_dialog(),
+
         // File ops.
         Key::O if plain || cmd_only => app.open_dialog(ctx),
         Key::O if shift_only => app.open_folder_dialog(ctx),
