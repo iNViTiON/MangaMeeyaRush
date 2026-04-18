@@ -174,6 +174,13 @@ fn dispatch_key(app: &mut App, ctx: &Context, key: Key, mods: Modifiers) {
         // parent, with the current book pre-selected.
         Key::Backspace => app.back_to_explorer(ctx),
 
+        // Image-filter bindings.
+        Key::R if plain => app.rotate(true),
+        Key::R if shift_only => app.rotate(false),
+        // Ctrl+R resets filters to identity (matches the legacy "no
+        // rotation" command).
+        Key::R if cmd_only => app.reset_filters(),
+
         // File ops.
         Key::O if plain || cmd_only => app.open_dialog(ctx),
         Key::O if shift_only => app.open_folder_dialog(ctx),

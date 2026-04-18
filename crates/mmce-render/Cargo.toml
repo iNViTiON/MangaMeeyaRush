@@ -12,3 +12,4 @@ egui.workspace = true
 mmce-core = { path = "../mmce-core" }
 mmce-codecs = { path = "../mmce-codecs" }
 mmce-config = { path = "../mmce-config" }
+mmce-filters = { path = "../mmce-filters" }

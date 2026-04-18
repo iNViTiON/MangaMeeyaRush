@@ -1968,6 +1968,7 @@ dependencies = [
  "mmce-codecs",
  "mmce-config",
  "mmce-core",
+ "mmce-filters",
  "mmce-render",
  "natord",
  "rfd",
@@ -2013,6 +2014,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mmce-filters"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "mmce-render"
 version = "0.1.0"
 dependencies = [
@@ -2023,6 +2034,7 @@ dependencies = [
  "mmce-codecs",
  "mmce-config",
  "mmce-core",
+ "mmce-filters",
 ]
 
 [[package]]

@@ -8,6 +8,7 @@ use egui::{CentralPanel, Color32, Context, Vec2, ViewportCommand};
 use mmce_codecs::{folder_has_direct_images, is_archive_path, PageSource};
 use mmce_config::{FitMode, PageMode, Settings};
 use mmce_core::{stride, Book, Spread, ViewerState};
+use mmce_filters::{FilterOp, Pipeline, Rotation};
 use mmce_render::{compute_size, PageCache};
 
 mod explorer;
@@ -32,11 +33,38 @@ pub struct App {
     book: Option<Book>,
     cache: Option<PageCache>,
     viewer: ViewerState,
+    /// Current image-filter state (rotate/clip/adjust/sharpen/resize). When
+    /// this changes we push it to the render cache which invalidates and
+    /// re-decodes pages.
+    pub(crate) filters: FilterState,
     status: String,
     last_error: Option<String>,
     pub(crate) current_path: Option<PathBuf>,
     pub(crate) view: View,
     pub(crate) explorer: Option<ExplorerState>,
+}
+
+/// High-level knobs the user actually touches. Serialized separately from
+/// the raw `Pipeline` so we can keep a stable UI order even as filters
+/// compose different ways under the hood.
+#[derive(Debug, Clone)]
+pub struct FilterState {
+    pub rotation: Rotation,
+}
+
+impl FilterState {
+    pub fn identity() -> Self {
+        Self { rotation: Rotation::Deg0 }
+    }
+
+    /// Build the actual pipeline that runs on each decoded page.
+    pub fn pipeline(&self) -> Pipeline {
+        let mut p = Pipeline::new();
+        if self.rotation != Rotation::Deg0 {
+            p.push(FilterOp::Rotate(self.rotation));
+        }
+        p
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +110,7 @@ impl App {
             book: None,
             cache: None,
             viewer,
+            filters: FilterState::identity(),
             status: String::new(),
             last_error: None,
             current_path: None,
@@ -138,6 +167,7 @@ impl App {
                     source,
                     self.settings.cache.picture_cache_size as usize,
                 );
+                cache.set_pipeline(self.filters.pipeline());
                 self.status = format!("Loaded {} ({} pages)", book.title(), pages);
                 self.last_error = if pages == 0 {
                     Some(format!(
@@ -293,6 +323,27 @@ impl App {
     pub(crate) fn explorer_thumb_smaller(&mut self) {
         if let Some(state) = self.explorer.as_mut() {
             state.thumb_smaller();
+        }
+    }
+
+    /// Rotate the viewer clockwise or counter-clockwise by 90°. Pushes the
+    /// updated pipeline to the page cache which triggers a re-decode.
+    pub(crate) fn rotate(&mut self, cw: bool) {
+        self.filters.rotation = if cw {
+            self.filters.rotation.next_cw()
+        } else {
+            self.filters.rotation.next_ccw()
+        };
+        if let Some(cache) = self.cache.as_ref() {
+            cache.set_pipeline(self.filters.pipeline());
+        }
+    }
+
+    /// Drop all active filters back to identity.
+    pub(crate) fn reset_filters(&mut self) {
+        self.filters = FilterState::identity();
+        if let Some(cache) = self.cache.as_ref() {
+            cache.set_pipeline(self.filters.pipeline());
         }
     }
 
@@ -468,16 +519,23 @@ impl eframe::App for App {
                                         _ => "auto→2",
                                     },
                                 };
+                                let rot_str = match self.filters.rotation {
+                                    Rotation::Deg0 => "",
+                                    Rotation::Deg90 => " rot=90°",
+                                    Rotation::Deg180 => " rot=180°",
+                                    Rotation::Deg270 => " rot=270°",
+                                };
                                 ui.colored_label(
                                     Color32::LIGHT_GRAY,
                                     format!(
-                                        "{} — {}/{}   [{}]   fit={:?} zoom={:.2}",
+                                        "{} — {}/{}   [{}]   fit={:?} zoom={:.2}{}",
                                         book.title(),
                                         book.cursor() + 1,
                                         book.len().max(1),
                                         mode_str,
                                         self.viewer.fit,
                                         self.viewer.zoom,
+                                        rot_str,
                                     ),
                                 );
                             } else {

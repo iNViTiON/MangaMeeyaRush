@@ -14,6 +14,7 @@ use egui::{ColorImage, Context, TextureHandle, TextureOptions, Vec2};
 use image::GenericImageView;
 use mmce_codecs::{decode_image, PageSource};
 use mmce_config::FitMode;
+use mmce_filters::Pipeline;
 
 pub mod fit;
 
@@ -44,6 +45,7 @@ impl DecodedPage {
 enum WorkerMsg {
     Decode { index: usize },
     SwapSource(Arc<dyn PageSource>),
+    SwapPipeline(Arc<Pipeline>),
     Shutdown,
 }
 
@@ -88,6 +90,7 @@ pub struct PageCache {
     tx: Sender<WorkerMsg>,
     _workers: Vec<thread::JoinHandle<()>>,
     source: Mutex<Arc<dyn PageSource>>,
+    pipeline: Mutex<Arc<Pipeline>>,
     egui_ctx: Context,
 }
 
@@ -98,10 +101,20 @@ impl PageCache {
             map: HashMap::new(),
             capacity: capacity.max(2),
         }));
+        let pipeline = Arc::new(Pipeline::new());
         let (tx, rx) = mpsc::channel();
         let rx = Arc::new(Mutex::new(rx));
         let workers = (0..2)
-            .map(|i| spawn_worker(i, rx.clone(), inner.clone(), source.clone(), ctx.clone()))
+            .map(|i| {
+                spawn_worker(
+                    i,
+                    rx.clone(),
+                    inner.clone(),
+                    source.clone(),
+                    pipeline.clone(),
+                    ctx.clone(),
+                )
+            })
             .collect();
         Self {
             inner,
@@ -109,8 +122,24 @@ impl PageCache {
             tx,
             _workers: workers,
             source: Mutex::new(source),
+            pipeline: Mutex::new(pipeline),
             egui_ctx: ctx,
         }
+    }
+
+    /// Swap in a new filter pipeline. Drops cached decodes (they were
+    /// produced against the old pipeline) and signals workers to rebuild.
+    pub fn set_pipeline(&self, pipeline: Pipeline) {
+        let arc = Arc::new(pipeline);
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.order.clear();
+            g.map.clear();
+        }
+        self.tex.lock().unwrap().clear();
+        *self.pipeline.lock().unwrap() = arc.clone();
+        let _ = self.tx.send(WorkerMsg::SwapPipeline(arc));
+        self.egui_ctx.request_repaint();
     }
 
     /// Intrinsic size of a decoded page, if it's currently in the cache.
@@ -196,12 +225,14 @@ fn spawn_worker(
     rx: Arc<Mutex<Receiver<WorkerMsg>>>,
     cache: Arc<Mutex<CacheInner>>,
     initial: Arc<dyn PageSource>,
+    initial_pipeline: Arc<Pipeline>,
     ctx: Context,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name(format!("mmce-decoder-{id}"))
         .spawn(move || {
             let mut source = initial;
+            let mut pipeline = initial_pipeline;
             loop {
                 // Lock only around recv — decoding runs unlocked so workers
                 // can process pages in parallel.
@@ -218,6 +249,7 @@ fn spawn_worker(
                 match msg {
                     WorkerMsg::Shutdown => break,
                     WorkerMsg::SwapSource(s) => source = s,
+                    WorkerMsg::SwapPipeline(p) => pipeline = p,
                     WorkerMsg::Decode { index } => {
                         let already = cache.lock().unwrap().map.contains_key(&index);
                         if already {
@@ -228,7 +260,12 @@ fn spawn_worker(
                         }
                         match source.read(index).and_then(|b| decode_image(&b)) {
                             Ok(img) => {
-                                let page = DecodedPage::from_dynamic(img);
+                                let filtered = if pipeline.is_identity() {
+                                    img
+                                } else {
+                                    pipeline.apply(img)
+                                };
+                                let page = DecodedPage::from_dynamic(filtered);
                                 cache.lock().unwrap().put(index, page);
                                 ctx.request_repaint();
                             }

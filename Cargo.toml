@@ -4,6 +4,7 @@ members = [
     "crates/mmce-config",
     "crates/mmce-codecs",
     "crates/mmce-core",
+    "crates/mmce-filters",
     "crates/mmce-render",
     "crates/mmce-app",
 ]
