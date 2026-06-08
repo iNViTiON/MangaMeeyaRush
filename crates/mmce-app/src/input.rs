@@ -115,7 +115,14 @@ fn dispatch_key(app: &mut App, ctx: &Context, key: Key, mods: Modifiers) {
             // Ctrl+F: filter toggle.
             Key::F if cmd_only => return app.toggle_explorer_filter(),
             // Escape closes the filter bar first; falls through to fullscreen exit below.
-            Key::Escape if plain && app.explorer.as_ref().map(|e| e.show_filter).unwrap_or(false) => {
+            Key::Escape
+                if plain
+                    && app
+                        .explorer
+                        .as_ref()
+                        .map(|e| e.show_filter)
+                        .unwrap_or(false) =>
+            {
                 app.close_explorer_filter();
                 return;
             }
@@ -131,22 +138,55 @@ fn dispatch_key(app: &mut App, ctx: &Context, key: Key, mods: Modifiers) {
     match key {
         // Spread / page navigation (book view).
         Key::ArrowRight if plain => {
-            if is_manga { backward_step(app) } else { forward_step(app) }
+            if is_manga {
+                backward_step(app)
+            } else {
+                forward_step(app)
+            }
         }
         Key::ArrowLeft if plain => {
-            if is_manga { forward_step(app) } else { backward_step(app) }
+            if is_manga {
+                forward_step(app)
+            } else {
+                backward_step(app)
+            }
         }
         Key::ArrowRight if shift_only => {
-            if is_manga { app.advance_pages(-1) } else { app.advance_pages(1) }
+            if is_manga {
+                app.advance_pages(-1)
+            } else {
+                app.advance_pages(1)
+            }
         }
         Key::ArrowLeft if shift_only => {
-            if is_manga { app.advance_pages(1) } else { app.advance_pages(-1) }
+            if is_manga {
+                app.advance_pages(1)
+            } else {
+                app.advance_pages(-1)
+            }
         }
+
+        // Skip: pin the prior page and slide only the later page of the
+        // 2-up spread. `/` forward, `Shift+/` back. egui reports the
+        // shifted slash either as `Slash`+shift or as the dedicated
+        // `Questionmark` key depending on the keyboard layout, so accept
+        // both.
+        Key::Slash if plain => app.skip_later_forward(),
+        Key::Slash if shift_only => app.skip_later_back(),
+        // `?` already implies shift on most layouts (and egui may or may not
+        // report that shift, depending on the layout), so accept it with or
+        // without shift — but never as a ctrl/alt/cmd chord.
+        Key::Questionmark if !mods.alt && !mods.ctrl && !mods.command => app.skip_later_back(),
+
         Key::Home if plain => {
-            if let Some(b) = app.book.as_mut() { b.first(); }
+            if let Some(b) = app.book.as_mut() {
+                b.first();
+            }
         }
         Key::End if plain => {
-            if let Some(b) = app.book.as_mut() { b.last(); }
+            if let Some(b) = app.book.as_mut() {
+                b.last();
+            }
         }
 
         // ±10 fast jump.
@@ -227,11 +267,9 @@ fn dispatch_key(app: &mut App, ctx: &Context, key: Key, mods: Modifiers) {
 }
 
 fn forward_step(app: &mut App) {
-    let s = app.current_stride() as isize;
-    app.advance_pages(s);
+    app.forward_spread();
 }
 
 fn backward_step(app: &mut App) {
-    let s = app.current_stride() as isize;
-    app.advance_pages(-s);
+    app.backward_spread();
 }

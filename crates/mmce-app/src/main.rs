@@ -3,21 +3,27 @@ use std::path::PathBuf;
 use anyhow::Result;
 use mmce_app::{App, CliArgs};
 
+
 fn main() -> Result<()> {
     // Default: warn for everything, info for our own crates. Third-party
     // libraries (zbus, calloop, winit, …) emit useful-to-them but
     // noisy-to-us INFO lines during normal operation — we don't want
     // those on stdout. Override with RUST_LOG=... to see more.
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(
-            "warn,mmce_app=info,mmce_core=info,mmce_render=info,\
+    //
+    // `calloop=error`: winit's Wayland backend logs a benign WARN on every
+    // frame —  "Received an event for non-existence source: …" — when a
+    // calloop source is removed while an event for it is still queued. It's
+    // an upstream sctk/winit teardown race we don't drive and can't fix from
+    // here, so we drop it below ERROR rather than let it flood the console.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
+        "warn,calloop=error,mmce_app=info,mmce_core=info,mmce_render=info,\
              mmce_codecs=info,mmce_store=info,mmce_filters=info,\
              mmce_config=info",
-        ),
-    )
+    ))
     .init();
 
     let cli = parse_cli();
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("mmce — manga viewer")
@@ -82,6 +88,7 @@ Options:
 Keyboard:
   ←/→       previous / next spread
   Shift+←/→ previous / next single page
+  / , ?     skip: slide only the later page of a 2-up spread (? = back)
   Home/End  first / last page
   Space     toggle single / spread mode
   + / -     zoom in / out

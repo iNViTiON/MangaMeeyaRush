@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use egui::{CentralPanel, Color32, Context, CursorIcon, Pos2, Vec2, ViewportCommand};
 use mmce_codecs::{folder_has_direct_images, is_archive_path, PageSource};
 use mmce_config::{FitMode, PageMode, Settings};
-use mmce_core::{stride, Book, Spread, ViewerState};
+use mmce_core::{Book, Spread, ViewerState};
 use mmce_filters::{FilterOp, Pipeline, Rotation};
 use mmce_render::{compute_size, PageCache};
 
@@ -118,7 +118,9 @@ pub struct FilterState {
 
 impl FilterState {
     pub fn identity() -> Self {
-        Self { rotation: Rotation::Deg0 }
+        Self {
+            rotation: Rotation::Deg0,
+        }
     }
 
     /// Build the actual pipeline that runs on each decoded page.
@@ -139,10 +141,7 @@ pub enum View {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, cli: CliArgs) -> Self {
-        let settings_path = cli
-            .ini
-            .clone()
-            .unwrap_or_else(default_settings_path);
+        let settings_path = cli.ini.clone().unwrap_or_else(default_settings_path);
 
         let mut settings = Settings::load(&settings_path).unwrap_or_default();
         if cli.fullscreen {
@@ -359,8 +358,8 @@ impl App {
             .add_filter(
                 "Images & archives",
                 &[
-                    "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff",
-                    "zip", "cbz", "7z", "cb7",
+                    "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "zip", "cbz", "7z",
+                    "cb7",
                 ],
             )
             .pick_file()
@@ -523,9 +522,11 @@ impl App {
     }
 
     pub(crate) fn toggle_bookmark(&mut self) {
-        let (Some(store), Some(id), Some(book)) =
-            (self.store.as_ref(), self.current_book_id, self.book.as_ref())
-        else {
+        let (Some(store), Some(id), Some(book)) = (
+            self.store.as_ref(),
+            self.current_book_id,
+            self.book.as_ref(),
+        ) else {
             return;
         };
         let page = book.cursor();
@@ -535,10 +536,7 @@ impl App {
                     let _ = store.remove_bookmark(id, page);
                     self.status = format!("Removed bookmark at page {}", page + 1);
                 } else {
-                    let label = book
-                        .source()
-                        .entry_name(page)
-                        .map(|s| s.to_string());
+                    let label = book.source().entry_name(page).map(|s| s.to_string());
                     let _ = store.add_bookmark(id, page, label.as_deref());
                     self.status = format!("Bookmarked page {}", page + 1);
                 }
@@ -652,8 +650,9 @@ impl App {
         // Same ordering the explorer grid uses: folders first (natural
         // sort), then archives (natural sort). Everything else is ignored
         // — Shift+↑/↓ should only hop between "book-shaped" neighbours.
-        let (mut folders, mut archives): (Vec<PathBuf>, Vec<PathBuf>) = match fs::read_dir(&parent) {
-            Ok(rd) => rd.flatten().filter_map(|e| Some(e.path())).fold(
+        let (mut folders, mut archives): (Vec<PathBuf>, Vec<PathBuf>) = match fs::read_dir(&parent)
+        {
+            Ok(rd) => rd.flatten().map(|e| e.path()).fold(
                 (Vec::new(), Vec::new()),
                 |(mut f, mut a), p| {
                     if p.is_dir() {
@@ -693,19 +692,62 @@ impl App {
         }
     }
 
+    /// Advance one spread forward, honouring an active `/` skip (which it
+    /// collapses) — see [`mmce_core::Book::next_spread`].
+    pub(crate) fn forward_spread(&mut self) {
+        let mode = self.effective_mode();
+        if let Some(b) = self.book.as_mut() {
+            b.next_spread(mode);
+        }
+    }
+
+    /// Advance one spread backward, honouring an active skip.
+    pub(crate) fn backward_spread(&mut self) {
+        let mode = self.effective_mode();
+        if let Some(b) = self.book.as_mut() {
+            b.prev_spread(mode);
+        }
+    }
+
+    /// `/` — pin the prior page and slide the later page one forward. Only
+    /// meaningful in a true 2-up spread display ("when displaying 2 pages").
+    pub(crate) fn skip_later_forward(&mut self) {
+        if matches!(self.effective_mode(), PageMode::Spread) {
+            if let Some(b) = self.book.as_mut() {
+                b.skip_forward();
+            }
+        }
+    }
+
+    /// `Shift+/` (or `?`) — pull the later page back toward the prior page.
+    pub(crate) fn skip_later_back(&mut self) {
+        if matches!(self.effective_mode(), PageMode::Spread) {
+            if let Some(b) = self.book.as_mut() {
+                b.skip_back();
+            }
+        }
+    }
+
     /// Resolve Auto → Single/Spread using whatever page dimensions are
     /// currently cached. Unknown pages default to portrait (spread).
     fn effective_mode(&self) -> PageMode {
-        match (self.viewer.page_mode, self.book.as_ref(), self.cache.as_ref()) {
+        match (
+            self.viewer.page_mode,
+            self.book.as_ref(),
+            self.cache.as_ref(),
+        ) {
             (PageMode::Auto, Some(book), Some(cache)) => {
                 let a = book.cursor();
                 let a_land = cache
                     .page_dimensions(a)
                     .map(|(w, h)| w > h)
                     .unwrap_or(false);
-                let b_land = if a + 1 < book.len() {
+                // Judge the page actually shown in the second slot, which a
+                // `/` skip may have slid past the adjacent page.
+                let second = a + 1 + book.gap();
+                let b_land = if second < book.len() {
                     cache
-                        .page_dimensions(a + 1)
+                        .page_dimensions(second)
                         .map(|(w, h)| w > h)
                         .unwrap_or(false)
                 } else {
@@ -721,10 +763,6 @@ impl App {
         }
     }
 
-    /// Stride in pages for the current navigation mode.
-    pub(crate) fn current_stride(&self) -> usize {
-        stride(self.effective_mode())
-    }
 }
 
 impl eframe::App for App {
@@ -803,13 +841,11 @@ impl eframe::App for App {
         // flip. Starting the flip is deferred until after draw_spread so
         // we have the NEW rects to anchor the landing geometry against.
         let cursor_change = match (self.book.as_ref(), self.last_book_cursor) {
-            (Some(b), Some(prev)) if b.cursor() != prev => {
-                Some(if b.cursor() > prev {
-                    FlipDir::Forward
-                } else {
-                    FlipDir::Backward
-                })
-            }
+            (Some(b), Some(prev)) if b.cursor() != prev => Some(if b.cursor() > prev {
+                FlipDir::Forward
+            } else {
+                FlipDir::Backward
+            }),
             _ => None,
         };
 
@@ -819,7 +855,7 @@ impl eframe::App for App {
             .frame(egui::Frame::none().fill(bg_book))
             .show(ctx, |ui| match self.view {
                 View::Book => match (self.book.as_ref(), self.cache.as_ref()) {
-                    (Some(book), Some(cache)) if book.len() > 0 => {
+                    (Some(book), Some(cache)) if !book.is_empty() => {
                         let spread = book.current_spread(effective, self.viewer.bind_dir);
                         book_page_rects = draw_spread(
                             ui,
@@ -839,9 +875,7 @@ impl eframe::App for App {
                             {
                                 let next_raw: Vec<PagePaint> = book_page_rects
                                     .iter()
-                                    .map(|(_, tex, rect)| {
-                                        PagePaint::full(tex.clone(), *rect)
-                                    })
+                                    .map(|(_, tex, rect)| PagePaint::full(tex.clone(), *rect))
                                     .collect();
                                 // The flip's hinge should always live at
                                 // the viewport centre, regardless of pan
@@ -901,7 +935,17 @@ impl eframe::App for App {
 
                         let window: Vec<usize> = spread.indices().collect();
                         if self.settings.cache.preload {
-                            cache.prefetch(&window, 2);
+                            // Forward-biased prefetch: users read forward
+                            // most of the time, so spend most of the
+                            // decoder budget ahead. `cursor_change` tells
+                            // us which way we just moved; feed it in so a
+                            // backtrack still looks the right way.
+                            let hint = match cursor_change {
+                                Some(FlipDir::Forward) => 1,
+                                Some(FlipDir::Backward) => -1,
+                                None => 0,
+                            };
+                            cache.prefetch_directed(&window, 4, 1, hint);
                         }
                     }
                     _ => draw_welcome(ui, self.last_error.as_deref()),
@@ -929,9 +973,7 @@ impl eframe::App for App {
             let idle = now.duration_since(self.last_pointer_move);
             let in_bar_zone = self
                 .last_pointer_pos
-                .map(|p| {
-                    p.y >= ctx.screen_rect().max.y - SEEK_BAR_ACTIVATION_ZONE
-                })
+                .map(|p| p.y >= ctx.screen_rect().max.y - SEEK_BAR_ACTIVATION_ZONE)
                 .unwrap_or(false);
             if idle >= POINTER_IDLE_TIMEOUT && !in_bar_zone {
                 ctx.set_cursor_icon(CursorIcon::None);
@@ -962,70 +1004,6 @@ impl eframe::App for App {
         } else if self.flip.is_some() {
             ctx.request_repaint();
         }
-
-        // Status bar.
-        egui::TopBottomPanel::bottom("status")
-            .show_separator_line(false)
-            .frame(
-                egui::Frame::none()
-                    .fill(Color32::from_black_alpha(160))
-                    .inner_margin(egui::Margin::symmetric(8.0, 2.0)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    match self.view {
-                        View::Book => {
-                            if let Some(book) = &self.book {
-                                let mode_str = match self.viewer.page_mode {
-                                    PageMode::Single => "single",
-                                    PageMode::Spread => "spread",
-                                    PageMode::Auto => match effective {
-                                        PageMode::Single => "auto→1",
-                                        _ => "auto→2",
-                                    },
-                                };
-                                let rot_str = match self.filters.rotation {
-                                    Rotation::Deg0 => "",
-                                    Rotation::Deg90 => " rot=90°",
-                                    Rotation::Deg180 => " rot=180°",
-                                    Rotation::Deg270 => " rot=270°",
-                                };
-                                ui.colored_label(
-                                    Color32::LIGHT_GRAY,
-                                    format!(
-                                        "{} — {}/{}   [{}]   fit={:?} zoom={:.2}{}",
-                                        book.title(),
-                                        book.cursor() + 1,
-                                        book.len().max(1),
-                                        mode_str,
-                                        self.viewer.fit,
-                                        self.viewer.zoom,
-                                        rot_str,
-                                    ),
-                                );
-                            } else {
-                                ui.colored_label(Color32::LIGHT_GRAY, &self.status);
-                            }
-                        }
-                        View::Explorer => {
-                            ui.colored_label(Color32::LIGHT_GRAY, "Explorer");
-                        }
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.colored_label(
-                            Color32::DARK_GRAY,
-                            match self.view {
-                                View::Book => {
-                                    "E explorer · PgUp/Dn ±10 · Shift+↑/↓ sibling · Space mode"
-                                }
-                                View::Explorer => {
-                                    "↑↓←→ select · Enter open · ⌫ up · Ctrl± resize"
-                                }
-                            },
-                        );
-                    });
-                });
-            });
 
         // File drops.
         let dropped: Vec<_> = ctx.input(|i| {
@@ -1107,8 +1085,7 @@ fn draw_spread(
         1 => {
             let (idx, tex) = pages.into_iter().next().unwrap();
             let intrinsic = tex.size_vec2();
-            let rendered =
-                compute_size(intrinsic, viewport, viewer.fit, viewer.zoom, no_zoom_in);
+            let rendered = compute_size(intrinsic, viewport, viewer.fit, viewer.zoom, no_zoom_in);
             if rendered.x <= 0.0 || rendered.y <= 0.0 {
                 return rects;
             }
@@ -1128,8 +1105,7 @@ fn draw_spread(
             let half = Vec2::new(viewport.x * 0.5, viewport.y);
             for (i, (idx, tex)) in pages.into_iter().enumerate() {
                 let intrinsic = tex.size_vec2();
-                let rendered =
-                    compute_size(intrinsic, half, viewer.fit, viewer.zoom, no_zoom_in);
+                let rendered = compute_size(intrinsic, half, viewer.fit, viewer.zoom, no_zoom_in);
                 if rendered.x <= 0.0 || rendered.y <= 0.0 {
                     continue;
                 }
@@ -1185,10 +1161,7 @@ const POINTER_IDLE_TIMEOUT: Duration = Duration::from_millis(2000);
 /// Paint a semi-transparent seek bar over the bottom of the central
 /// panel and return the target page index if the user clicked/dragged
 /// to a new spot.
-fn paint_seekbar_overlay(
-    ui: &mut egui::Ui,
-    book: &Book,
-) -> Option<usize> {
+fn paint_seekbar_overlay(ui: &mut egui::Ui, book: &Book) -> Option<usize> {
     let viewport = ui.max_rect();
     let bar_h = 28.0;
     let side_pad = 16.0;
@@ -1289,19 +1262,13 @@ fn import_legacy_ini_once(store: &mmce_store::Store) {
                     mmce_config::BindDir::RightToLeft => "rtl",
                 },
             );
-            let _ = store.set_setting(
-                "legacy.bg_color",
-                &settings.general.bg_color.to_string(),
-            );
+            let _ = store.set_setting("legacy.bg_color", &settings.general.bg_color.to_string());
             imported += 1;
             break;
         }
     }
 
-    let _ = store.set_setting(
-        "legacy_ini_imported",
-        if imported > 0 { "1" } else { "0" },
-    );
+    let _ = store.set_setting("legacy_ini_imported", if imported > 0 { "1" } else { "0" });
     if imported > 0 {
         log::info!("imported legacy MangaMeeyaCE.ini into state.db");
     }

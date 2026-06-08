@@ -14,12 +14,21 @@ pub use mmce_config;
 pub struct Book {
     source: Arc<dyn PageSource>,
     cursor: usize,
+    /// Skip distance: in a 2-up spread the *later* (non-pinned) page is
+    /// `cursor + 1 + gap`. `gap == 0` is the normal adjacent pair. The `/`
+    /// key grows it, pinning the prior page while the later page slides
+    /// forward; any cursor move resets it to 0. See [`Book::skip_forward`].
+    gap: usize,
 }
 
 impl Book {
     pub fn open(path: &Path) -> Result<Self, CodecError> {
         let source: Arc<dyn PageSource> = Arc::from(open_source(path)?);
-        Ok(Self { source, cursor: 0 })
+        Ok(Self {
+            source,
+            cursor: 0,
+            gap: 0,
+        })
     }
 
     pub fn source(&self) -> &Arc<dyn PageSource> {
@@ -43,6 +52,7 @@ impl Book {
     }
 
     pub fn goto(&mut self, idx: usize) {
+        self.gap = 0;
         if self.source.is_empty() {
             self.cursor = 0;
         } else {
@@ -51,17 +61,21 @@ impl Book {
     }
 
     pub fn first(&mut self) {
+        self.gap = 0;
         self.cursor = 0;
     }
 
     pub fn last(&mut self) {
+        self.gap = 0;
         if !self.source.is_empty() {
             self.cursor = self.source.len() - 1;
         }
     }
 
     /// Move by an arbitrary signed page delta, clamped to `[0, len-1]`.
+    /// Any cursor move resets an active skip (`gap`) back to adjacent.
     pub fn advance(&mut self, delta: isize) {
+        self.gap = 0;
         if self.source.is_empty() {
             self.cursor = 0;
             return;
@@ -73,17 +87,57 @@ impl Book {
 
     /// Move forward by a spread (1 or 2 pages depending on mode).
     ///
+    /// When a skip is active (`gap > 0`) in a 2-up mode, this instead
+    /// *collapses* the skip: the pinned page advances by a single page and
+    /// the pair becomes adjacent again (so e.g. a `5|2` spread steps to
+    /// `4|3`, not `7|6`). `advance` clears the gap as a side effect.
+    ///
     /// For `PageMode::Auto` the caller should resolve to Single or Spread
     /// first; passing Auto here treats it like Spread.
     pub fn next_spread(&mut self, mode: PageMode) {
-        let step = stride(mode);
-        self.advance(step as isize);
+        if self.gap > 0 && matches!(mode, PageMode::Spread | PageMode::Auto) {
+            self.advance(1);
+        } else {
+            self.advance(stride(mode) as isize);
+        }
     }
 
-    /// Move backward by a spread.
+    /// Move backward by a spread. Mirrors [`Book::next_spread`]: collapses an
+    /// active skip by stepping the pinned page back a single page.
     pub fn prev_spread(&mut self, mode: PageMode) {
-        let step = stride(mode);
-        self.advance(-(step as isize));
+        if self.gap > 0 && matches!(mode, PageMode::Spread | PageMode::Auto) {
+            self.advance(-1);
+        } else {
+            self.advance(-(stride(mode) as isize));
+        }
+    }
+
+    /// Slide only the *later* (non-pinned) page of the spread one page
+    /// forward, keeping the prior page fixed — the `/` "skip". No-op once the
+    /// later page reaches the last page, or when there is no second page.
+    /// Callers gate this to a true 2-up spread display.
+    pub fn skip_forward(&mut self) {
+        if self.source.is_empty() {
+            return;
+        }
+        let last = self.source.len() - 1;
+        // The later page index is `cursor + 1 + gap`; keep it within bounds.
+        if self.cursor + 1 + self.gap < last {
+            self.gap += 1;
+        }
+    }
+
+    /// Reverse of [`Book::skip_forward`] — pull the later page one back toward
+    /// the prior page. Floors at the adjacent pair (`gap == 0`). The `Shift+/`
+    /// (or `?`) skip.
+    pub fn skip_back(&mut self) {
+        self.gap = self.gap.saturating_sub(1);
+    }
+
+    /// Current skip distance: the later page of the spread is
+    /// `cursor + 1 + gap`. `0` is the normal adjacent pair.
+    pub fn gap(&self) -> usize {
+        self.gap
     }
 
     /// Nudge one page forward (Shift+→).
@@ -105,8 +159,11 @@ impl Book {
         }
         let a = self.cursor;
         let want_pair = matches!(mode, PageMode::Spread | PageMode::Auto);
+        // The later page is `a + 1 + gap`; `gap` is normally 0 (adjacent).
+        // `.min` is a defensive clamp — `skip_forward` already keeps it in
+        // range, so this only matters if `len` shrank under a stale gap.
         let b = if want_pair && a + 1 < self.len() {
-            Some(a + 1)
+            Some((a + 1 + self.gap).min(self.len() - 1))
         } else {
             None
         };
@@ -226,6 +283,7 @@ mod tests {
         Book {
             source: Arc::new(Fake(n)),
             cursor: 0,
+            gap: 0,
         }
     }
 
@@ -292,6 +350,110 @@ mod tests {
     }
 
     #[test]
+    fn skip_slides_only_later_page_rtl() {
+        // RTL spread at cursor 2 shows (L=3, R=2). `/` pins the prior page
+        // (2, on the right) and slides the later page (left) forward.
+        let mut b = book(10);
+        b.cursor = 2;
+
+        b.skip_forward(); // 4|2
+        assert_eq!(b.gap(), 1);
+        let s = b.current_spread(PageMode::Spread, BindDir::RightToLeft);
+        assert_eq!((s.left, s.right), (Some(4), Some(2)));
+
+        b.skip_forward(); // 5|2
+        assert_eq!(b.gap(), 2);
+        let s = b.current_spread(PageMode::Spread, BindDir::RightToLeft);
+        assert_eq!((s.left, s.right), (Some(5), Some(2)));
+    }
+
+    #[test]
+    fn skip_back_floors_at_adjacent() {
+        let mut b = book(10);
+        b.cursor = 2;
+        b.skip_forward();
+        b.skip_forward(); // gap 2
+        b.skip_back(); // gap 1
+        assert_eq!(b.gap(), 1);
+        b.skip_back(); // gap 0
+        b.skip_back(); // floor
+        assert_eq!(b.gap(), 0);
+        let s = b.current_spread(PageMode::Spread, BindDir::RightToLeft);
+        assert_eq!((s.left, s.right), (Some(3), Some(2)));
+    }
+
+    #[test]
+    fn skip_forward_clamps_to_last_page() {
+        // 4-page book at cursor 0: later page may reach index 3 (last) but no
+        // further, so gap saturates at 2 (later = 0 + 1 + 2 = 3).
+        let mut b = book(4);
+        for _ in 0..10 {
+            b.skip_forward();
+        }
+        assert_eq!(b.gap(), 2);
+        let s = b.current_spread(PageMode::Spread, BindDir::RightToLeft);
+        assert_eq!((s.left, s.right), (Some(3), Some(0)));
+    }
+
+    #[test]
+    fn normal_next_collapses_skip_advancing_one() {
+        // User-specified: from 5|2, a normal forward step lands on 4|3 — the
+        // pinned page advances a single page and the pair re-pairs adjacent.
+        let mut b = book(10);
+        b.cursor = 2;
+        b.skip_forward();
+        b.skip_forward(); // 5|2, gap 2
+        b.next_spread(PageMode::Spread);
+        assert_eq!(b.cursor, 3);
+        assert_eq!(b.gap(), 0);
+        let s = b.current_spread(PageMode::Spread, BindDir::RightToLeft);
+        assert_eq!((s.left, s.right), (Some(4), Some(3)));
+    }
+
+    #[test]
+    fn normal_prev_collapses_skip_stepping_back_one() {
+        let mut b = book(10);
+        b.cursor = 4;
+        b.skip_forward();
+        b.skip_forward(); // 7|4, gap 2
+        b.prev_spread(PageMode::Spread);
+        assert_eq!(b.cursor, 3);
+        assert_eq!(b.gap(), 0);
+    }
+
+    #[test]
+    fn any_cursor_move_resets_skip() {
+        let mut b = book(20);
+        b.cursor = 4;
+        b.skip_forward();
+        b.skip_forward();
+        b.advance(1);
+        assert_eq!(b.gap(), 0);
+
+        b.skip_forward();
+        b.goto(10);
+        assert_eq!(b.gap(), 0);
+
+        b.skip_forward();
+        b.first();
+        assert_eq!(b.gap(), 0);
+
+        b.skip_forward();
+        b.last();
+        assert_eq!(b.gap(), 0);
+    }
+
+    #[test]
+    fn single_mode_ignores_skip() {
+        // Even with a gap set, single-page display shows only the cursor page.
+        let mut b = book(10);
+        b.cursor = 2;
+        b.skip_forward();
+        let s = b.current_spread(PageMode::Single, BindDir::RightToLeft);
+        assert_eq!((s.left, s.right), (Some(2), None));
+    }
+
+    #[test]
     fn next_spread_clamps_to_last() {
         let mut b = book(3);
         b.cursor = 2;
@@ -312,6 +474,9 @@ mod tests {
         b.next_spread(PageMode::Spread);
         b.prev_spread(PageMode::Spread);
         assert_eq!(b.cursor, 0);
-        assert_eq!(b.current_spread(PageMode::Spread, BindDir::RightToLeft), Spread::default());
+        assert_eq!(
+            b.current_spread(PageMode::Spread, BindDir::RightToLeft),
+            Spread::default()
+        );
     }
 }

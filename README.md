@@ -18,6 +18,7 @@ ground-truth reference) live under [`legacy/`](legacy/).
 - Keyboard bindings matching the readme:
   - `←` / `→` — previous / next spread
   - `Shift+←` / `Shift+→` — step a single page
+  - `/` / `?` — skip: pin the prior page, slide only the later page of a 2-up spread (`?` reverses)
   - `Home` / `End` — first / last page
   - `Space` — toggle single / spread
   - `+` / `-` — zoom in / out
