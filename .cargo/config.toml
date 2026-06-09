@@ -1,0 +1,7 @@
+# Build with the host CPU's full instruction set — lets zune-jpeg and the
+# image crate's SIMD paths (AVX2/AVX-512/NEON) kick in for decode. This
+# makes the release binary non-portable across CPU families; that's fine
+# for a self-built desktop app. Cross-compile users can override with
+# `CARGO_TARGET_<...>_RUSTFLAGS` or pass `--config` on the command line.
+[build]
+rustflags = ["-C", "target-cpu=native"]

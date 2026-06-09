@@ -46,6 +46,8 @@ These can be added later — none of them are on the fast path for reading.
 
 ### NixOS (recommended — what this repo targets)
 
+Develop / run from a checkout:
+
 ```sh
 direnv allow     # picks up flake.nix automatically, or:
 nix develop
@@ -54,14 +56,30 @@ cargo build --release
 ./target/release/mmce /path/to/book.cbz
 ```
 
-All runtime libraries (OpenGL, Wayland, X11, fontconfig, bzip2) are wired
-into the dev shell by the flake.
+All runtime libraries (OpenGL, Wayland, X11, fontconfig, bzip2) plus the
+build-time tools (`nasm` + `cmake`, needed to compile the bundled
+libjpeg-turbo that powers fast thumbnail decoding) are wired into the dev
+shell by the flake.
+
+Build or install the packaged binary — it's wrapped so it runs outside the
+dev shell (the runtime libraries are baked onto its `LD_LIBRARY_PATH`):
+
+```sh
+nix build .                  # -> ./result/bin/mmce
+nix run   . -- /path/to/book.cbz
+
+nix profile add .            # install `mmce` into your profile, run from anywhere
+# older Nix: nix profile install .
+nix profile remove mmce      # uninstall
+```
 
 ### Non-Nix Linux / macOS / Windows
 
-Needs Rust 1.82+. On Linux you'll also need the distro packages for
-`libxkbcommon`, `libGL`, `wayland`, `libX11`, `libxcursor`, `libxi`,
-`libxrandr`, `fontconfig`, and `bzip2`.
+Needs Rust 1.82+, plus `nasm` and `cmake` at build time (to compile the
+bundled libjpeg-turbo / `mozjpeg-sys` used for fast thumbnail decoding). On
+Linux you'll also need the distro packages for `libxkbcommon`, `libGL`,
+`wayland`, `libX11`, `libxcursor`, `libxi`, `libxrandr`, `fontconfig`, and
+`bzip2`.
 
 ```sh
 cargo build --release

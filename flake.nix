@@ -64,6 +64,8 @@
           nativeBuildInputs = with pkgs; [
             pkg-config
             cmake
+            # mozjpeg-sys assembles libjpeg-turbo's SIMD kernels with nasm.
+            nasm
             makeWrapper
           ];
 
@@ -101,6 +103,8 @@
             toolchain
             pkg-config
             cmake
+            # mozjpeg-sys assembles libjpeg-turbo's SIMD kernels with nasm.
+            nasm
             xvfb-run
           ];
 

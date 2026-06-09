@@ -5,3 +5,11 @@
 Cargo.lock.bak
 *.swp
 .DS_Store
+
+# Nix cargo-vendor output — we build from Cargo.lock, never commit vendored crates.
+/vendor
+
+# SQLite store + WAL sidecars (the app/tests can fall back to writing in cwd).
+*.db
+*.db-shm
+*.db-wal

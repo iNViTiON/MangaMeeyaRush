@@ -10,9 +10,14 @@ thiserror.workspace = true
 log.workspace = true
 image.workspace = true
 zip.workspace = true
+# Direct dep needed so the workspace's zlib-rs feature override on flate2
+# actually gets unified into the build. zip and png consume flate2
+# transitively; this line is what makes the SIMD backend win.
+flate2.workspace = true
 sevenz-rust2.workspace = true
 tar.workspace = true
 natord.workspace = true
+mozjpeg.workspace = true
 mmce-config = { path = "../mmce-config" }
 
 [dev-dependencies]

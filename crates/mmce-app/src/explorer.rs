@@ -59,8 +59,11 @@ impl ExplorerState {
             show_filter: false,
             cache: ThumbnailCache::new(ctx.clone(), 768),
             selection: 0,
-            tile_w: 180.0,
-            thumb_size: 160,
+            // Three `thumb_smaller` steps below the previous 180.0 default:
+            // 180 / 1.2³ ≈ 104.2. `thumb_size` follows `tile_w * 0.89`
+            // rounded to the nearest 8 (see `set_tile_width`) → 88.
+            tile_w: 104.0,
+            thumb_size: 88,
             columns: 1,
         };
         s.refresh();
@@ -180,11 +183,7 @@ impl ExplorerState {
         std::fs::rename(&src, &dst)?;
         self.refresh();
         // Re-select the renamed entry if we can find it in the filtered view.
-        if let Some(i) = self
-            .visible_entries()
-            .iter()
-            .position(|e| e.path == dst)
-        {
+        if let Some(i) = self.visible_entries().iter().position(|e| e.path == dst) {
             self.selection = i;
         }
         Ok(())
@@ -278,8 +277,7 @@ pub fn draw(ui: &mut Ui, state: &mut ExplorerState) -> Option<Entry> {
         ui.heading("📂 Explorer");
         ui.separator();
         ui.label(
-            egui::RichText::new(state.current.display().to_string())
-                .color(Color32::LIGHT_GRAY),
+            egui::RichText::new(state.current.display().to_string()).color(Color32::LIGHT_GRAY),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
@@ -298,7 +296,9 @@ pub fn draw(ui: &mut Ui, state: &mut ExplorerState) -> Option<Entry> {
     if state.show_filter {
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("Filter:").small().color(Color32::LIGHT_GRAY),
+                egui::RichText::new("Filter:")
+                    .small()
+                    .color(Color32::LIGHT_GRAY),
             );
             let resp = ui.text_edit_singleline(&mut state.filter);
             resp.request_focus();
@@ -331,9 +331,15 @@ pub fn draw(ui: &mut Ui, state: &mut ExplorerState) -> Option<Entry> {
     // `selection` is an index into this vector.
     let visible: Vec<Entry> = state.visible_entries().into_iter().cloned().collect();
 
-    ScrollArea::vertical()
+    // Collect paths we rendered (so we can prefetch the N rows above/below
+    // the visible clip on the next pass). `visible_rects` pairs each entry
+    // with the rect we reserved for it inside the scroll area.
+    let mut visible_rects: Vec<(PathBuf, egui::Rect)> = Vec::new();
+
+    let clip = ScrollArea::vertical()
         .auto_shrink([false; 2])
         .show(ui, |ui| {
+            let clip_rect = ui.clip_rect();
             if visible.is_empty() {
                 let msg = if state.filter.is_empty() {
                     "(empty folder)"
@@ -341,7 +347,7 @@ pub fn draw(ui: &mut Ui, state: &mut ExplorerState) -> Option<Entry> {
                     "(no matches)"
                 };
                 ui.colored_label(Color32::GRAY, msg);
-                return;
+                return clip_rect;
             }
             let mut it = visible.iter().enumerate();
             loop {
@@ -352,7 +358,7 @@ pub fn draw(ui: &mut Ui, state: &mut ExplorerState) -> Option<Entry> {
                 ui.horizontal(|ui| {
                     for (i, entry) in row {
                         let selected = i == selection;
-                        let hit = draw_tile(
+                        let (hit, rect) = draw_tile(
                             ui,
                             entry,
                             &state.cache,
@@ -365,14 +371,40 @@ pub fn draw(ui: &mut Ui, state: &mut ExplorerState) -> Option<Entry> {
                         if hit {
                             clicked = Some(entry.clone());
                         }
+                        visible_rects.push((entry.path.clone(), rect));
                     }
                 });
             }
-        });
+            clip_rect
+        })
+        .inner;
+
+    // Prefetch every off-screen tile in the current filtered view at low
+    // priority. Visible tiles were already queued at HIGH priority inside
+    // `draw_tile` via `thumbnail()`; we only top-up the ones further down
+    // the scroll. Dedup in the worker pool means re-calling this each
+    // frame is idempotent.
+    prefetch_all(&state.cache, &visible_rects, clip, thumb_size);
 
     clicked
 }
 
+fn prefetch_all(
+    cache: &ThumbnailCache,
+    rects: &[(PathBuf, egui::Rect)],
+    clip: egui::Rect,
+    thumb_size: u32,
+) {
+    for (path, rect) in rects {
+        // Already on screen → `thumbnail()` took the HIGH-priority path.
+        if clip.intersects(*rect) {
+            continue;
+        }
+        cache.prefetch(path, thumb_size);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_tile(
     ui: &mut Ui,
     entry: &Entry,
@@ -382,7 +414,7 @@ fn draw_tile(
     thumb_h: f32,
     thumb_size: u32,
     selected: bool,
-) -> bool {
+) -> (bool, egui::Rect) {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(tile_w, tile_h), Sense::click());
 
     // Selection always requests scroll-into-view so keyboard nav can move
@@ -396,9 +428,10 @@ fn draw_tile(
     // viewport. The allocate_exact_size above still reserves space so the
     // scroll area sizes correctly — we just don't touch the cache. This is
     // the single biggest anti-flicker fix: the decoder queue no longer
-    // drowns in requests for off-screen rows.
+    // drowns in requests for off-screen rows. We still return the reserved
+    // rect so the caller can decide whether to prefetch this tile.
     if !ui.clip_rect().intersects(rect) {
-        return false;
+        return (false, rect);
     }
 
     let painter = ui.painter_at(rect);
@@ -447,7 +480,9 @@ fn draw_tile(
         },
     );
 
-    resp.clicked()
+    // Show the full filename when labels get truncated by the tile width.
+    let resp = resp.on_hover_text(&entry.label);
+    (resp.clicked(), rect)
 }
 
 fn paint_thumb(

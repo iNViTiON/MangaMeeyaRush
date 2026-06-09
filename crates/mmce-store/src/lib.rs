@@ -146,11 +146,11 @@ impl Store {
                    last_opened_at = excluded.last_opened_at",
             params![path, kind, now_secs()],
         )?;
-        let id: BookId = self
-            .conn
-            .query_row("SELECT id FROM book WHERE path = ?1", params![path], |r| {
-                r.get(0)
-            })?;
+        let id: BookId =
+            self.conn
+                .query_row("SELECT id FROM book WHERE path = ?1", params![path], |r| {
+                    r.get(0)
+                })?;
         Ok(id)
     }
 
@@ -212,12 +212,7 @@ impl Store {
 
     /// Insert a bookmark at `page` for `book_id`. If one already exists at
     /// that page, updates the label.
-    pub fn add_bookmark(
-        &self,
-        book_id: BookId,
-        page: usize,
-        label: Option<&str>,
-    ) -> Result<i64> {
+    pub fn add_bookmark(&self, book_id: BookId, page: usize, label: Option<&str>) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO bookmark(book_id, page, label, created_at)
              VALUES (?1, ?2, ?3, ?4)
@@ -306,7 +301,9 @@ impl Store {
     }
 
     pub fn list_profiles(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT name FROM profile ORDER BY name")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM profile ORDER BY name")?;
         let rows = stmt
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;

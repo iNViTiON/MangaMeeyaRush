@@ -37,26 +37,26 @@ impl BookmarksDialog {
                         "No bookmarks yet — press Ctrl+D to add one.",
                     );
                 } else {
-                    ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                        for row in &self.rows {
-                            let label = row
-                                .label
-                                .clone()
-                                .unwrap_or_else(|| format!("Page {}", row.page + 1));
-                            if ui
-                                .button(format!("{}   (page {})", label, row.page + 1))
-                                .clicked()
-                            {
-                                result = Some(row.page as usize);
-                                close = true;
+                    ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            for row in &self.rows {
+                                let label = row
+                                    .label
+                                    .clone()
+                                    .unwrap_or_else(|| format!("Page {}", row.page + 1));
+                                if ui
+                                    .button(format!("{}   (page {})", label, row.page + 1))
+                                    .clicked()
+                                {
+                                    result = Some(row.page as usize);
+                                    close = true;
+                                }
                             }
-                        }
-                    });
+                        });
                 }
                 ui.separator();
-                if ui.button("Close").clicked()
-                    || ctx.input(|i| i.key_pressed(Key::Escape))
-                {
+                if ui.button("Close").clicked() || ctx.input(|i| i.key_pressed(Key::Escape)) {
                     close = true;
                 }
             });

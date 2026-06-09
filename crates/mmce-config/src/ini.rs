@@ -96,7 +96,9 @@ impl Ini {
     }
 
     pub fn section(&self, name: &str) -> Option<&Section> {
-        self.sections.iter().find(|s| s.name.eq_ignore_ascii_case(name))
+        self.sections
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name))
     }
 
     pub fn section_mut(&mut self, name: &str) -> &mut Section {

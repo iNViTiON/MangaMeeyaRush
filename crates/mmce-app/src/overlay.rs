@@ -2,9 +2,7 @@
 //! central book view; none of these widgets affect layout so they can be
 //! toggled without re-flowing the spread.
 
-use egui::{
-    Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, TextureHandle, Ui, Vec2,
-};
+use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, TextureHandle, Ui, Vec2};
 use mmce_core::{Book, Spread};
 use mmce_render::PageCache;
 
@@ -33,7 +31,12 @@ pub fn paint_info(ui: &Ui, book: &Book, cache: &PageCache, spread: Spread) {
     let painter = ui.painter();
     let max_w = lines
         .iter()
-        .map(|s| painter.layout_no_wrap(s.clone(), font.clone(), Color32::WHITE).rect.width())
+        .map(|s| {
+            painter
+                .layout_no_wrap(s.clone(), font.clone(), Color32::WHITE)
+                .rect
+                .width()
+        })
         .fold(0.0_f32, f32::max);
 
     let panel = Rect::from_min_size(
@@ -41,11 +44,7 @@ pub fn paint_info(ui: &Ui, book: &Book, cache: &PageCache, spread: Spread) {
         Vec2::new(max_w + pad * 2.0, line_h * lines.len() as f32 + pad * 2.0),
     );
     painter.rect_filled(panel, 6.0, Color32::from_black_alpha(170));
-    painter.rect_stroke(
-        panel,
-        6.0,
-        Stroke::new(1.0, Color32::from_white_alpha(40)),
-    );
+    painter.rect_stroke(panel, 6.0, Stroke::new(1.0, Color32::from_white_alpha(40)));
     for (i, line) in lines.iter().enumerate() {
         painter.text(
             origin + Vec2::new(pad, pad + i as f32 * line_h),

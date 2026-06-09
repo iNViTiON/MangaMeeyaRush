@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Write;
 
 use image::{ImageBuffer, Rgb};
-use mmce_codecs::{decode_image, open_source, PageSource};
+use mmce_codecs::{decode_image, open_source};
 
 fn make_png(seed: u8) -> Vec<u8> {
     let buf: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(40, 60, |x, y| {
@@ -49,7 +49,10 @@ fn zip_source_reads_images_by_index() {
         let mut w = zip::ZipWriter::new(f);
         let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored);
-        for (i, name) in ["page01.png", "page02.png", "page10.png"].iter().enumerate() {
+        for (i, name) in ["page01.png", "page02.png", "page10.png"]
+            .iter()
+            .enumerate()
+        {
             w.start_file(*name, opts).unwrap();
             w.write_all(&make_png(i as u8 + 1)).unwrap();
         }
@@ -77,7 +80,11 @@ fn folder_source_default_is_direct_only() {
     fs::write(ch_a.join("01.png"), make_png(1)).unwrap();
 
     let src = open_source(dir.path()).unwrap();
-    assert_eq!(src.len(), 0, "library folders must not swallow chapter pages");
+    assert_eq!(
+        src.len(),
+        0,
+        "library folders must not swallow chapter pages"
+    );
 }
 
 #[test]
@@ -104,4 +111,41 @@ fn loose_image_opens_parent_directory() {
     fs::write(dir.path().join("b.png"), make_png(8)).unwrap();
     let src = open_source(&dir.path().join("a.png")).unwrap();
     assert_eq!(src.len(), 2);
+}
+
+#[test]
+fn zip_source_supports_concurrent_reads() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let dir = tempfile::tempdir().unwrap();
+    let zip_path = dir.path().join("concurrent.cbz");
+    {
+        let f = fs::File::create(&zip_path).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for i in 0..16 {
+            w.start_file(format!("p{i:02}.png"), opts).unwrap();
+            w.write_all(&make_png(i as u8)).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    let src: Arc<dyn mmce_codecs::PageSource> = Arc::from(open_source(&zip_path).unwrap());
+    // Hammer the source from multiple threads to exercise the pool.
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let s = src.clone();
+        handles.push(thread::spawn(move || {
+            for i in 0..16 {
+                let bytes = s.read(i).expect("concurrent read");
+                let img = decode_image(&bytes).expect("concurrent decode");
+                assert_eq!(img.width(), 40);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
 }

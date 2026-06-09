@@ -33,29 +33,26 @@ impl HistoryDialog {
                 if self.rows.is_empty() {
                     ui.colored_label(egui::Color32::GRAY, "No history yet.");
                 } else {
-                    ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                        for row in &self.rows {
-                            let display = short_label(&row.path);
-                            let progress = match row.page_count {
-                                Some(total) if total > 0 => {
-                                    format!("  ({}/{})", row.last_page + 1, total)
+                    ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            for row in &self.rows {
+                                let display = short_label(&row.path);
+                                let progress = match row.page_count {
+                                    Some(total) if total > 0 => {
+                                        format!("  ({}/{})", row.last_page + 1, total)
+                                    }
+                                    _ => String::new(),
+                                };
+                                if ui.button(format!("{}{}", display, progress)).clicked() {
+                                    result = Some(PathBuf::from(&row.path));
+                                    close = true;
                                 }
-                                _ => String::new(),
-                            };
-                            if ui
-                                .button(format!("{}{}", display, progress))
-                                .clicked()
-                            {
-                                result = Some(PathBuf::from(&row.path));
-                                close = true;
                             }
-                        }
-                    });
+                        });
                 }
                 ui.separator();
-                if ui.button("Close").clicked()
-                    || ctx.input(|i| i.key_pressed(Key::Escape))
-                {
+                if ui.button("Close").clicked() || ctx.input(|i| i.key_pressed(Key::Escape)) {
                     close = true;
                 }
             });

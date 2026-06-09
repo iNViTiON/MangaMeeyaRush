@@ -1,21 +1,29 @@
 //! 7z / cb7 archive as a PageSource.
 //!
-//! Enumeration walks the archive once at open via `ArchiveReader::for_each_entries`
-//! to collect image entry names. Reads use `ArchiveReader::read_file` by entry
-//! name. Because solid archives may re-decompress upstream blocks per read, we
-//! lean on mmce-render's LRU cache to absorb repeated access.
+//! Enumeration walks the archive once at open via
+//! `ArchiveReader::for_each_entries` to collect image entry names. Reads
+//! use `ArchiveReader::read_file` on a pooled reader instance so decoder
+//! workers can decompress concurrently — each instance maintains its own
+//! solid-block state, so multiple readers in parallel do give real
+//! throughput on NVMe even though a single solid block read is inherently
+//! sequential.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use sevenz_rust2::{ArchiveReader, Password};
 
 use crate::{is_image_path, CodecError, PageSource};
 
+/// Cap on pooled reader instances. Each holds an open file handle + a
+/// decompression context; the cap keeps descriptor and memory use bounded.
+const MAX_POOL: usize = 8;
+
 pub struct SevenzSource {
     name: String,
+    path: PathBuf,
     entries: Vec<Entry>,
-    reader: Mutex<ArchiveReader<std::fs::File>>,
+    pool: Mutex<Vec<ArchiveReader<std::fs::File>>>,
 }
 
 struct Entry {
@@ -39,8 +47,7 @@ impl SevenzSource {
                 }
                 // We still need to consume the reader stream even for files we
                 // skip, to keep the solid-block decoder advancing correctly.
-                std::io::copy(r, &mut std::io::sink())
-                    .map_err(sevenz_rust2::Error::from)?;
+                std::io::copy(r, &mut std::io::sink()).map_err(sevenz_rust2::Error::from)?;
                 Ok(true)
             })
             .map_err(|e| CodecError::Sevenz(e.to_string()))?;
@@ -55,9 +62,27 @@ impl SevenzSource {
 
         Ok(Self {
             name,
+            path: path.to_path_buf(),
             entries,
-            reader: Mutex::new(reader),
+            // Seed the pool with the reader we just used for enumeration.
+            pool: Mutex::new(vec![reader]),
         })
+    }
+
+    fn acquire(&self) -> Result<ArchiveReader<std::fs::File>, CodecError> {
+        if let Some(r) = self.pool.lock().ok().and_then(|mut p| p.pop()) {
+            return Ok(r);
+        }
+        ArchiveReader::open(&self.path, Password::empty())
+            .map_err(|e| CodecError::Sevenz(e.to_string()))
+    }
+
+    fn release(&self, reader: ArchiveReader<std::fs::File>) {
+        if let Ok(mut pool) = self.pool.lock() {
+            if pool.len() < MAX_POOL {
+                pool.push(reader);
+            }
+        }
     }
 }
 
@@ -79,13 +104,11 @@ impl PageSource for SevenzSource {
             .entries
             .get(idx)
             .ok_or(CodecError::OutOfRange(idx, self.entries.len()))?;
-        let mut reader = self
-            .reader
-            .lock()
-            .map_err(|_| CodecError::Other("7z mutex poisoned".into()))?;
-        // `read_file` returns the decompressed bytes directly.
-        reader
+        let mut reader = self.acquire()?;
+        let result = reader
             .read_file(&entry.archive_name)
-            .map_err(|e| CodecError::Sevenz(e.to_string()))
+            .map_err(|e| CodecError::Sevenz(e.to_string()));
+        self.release(reader);
+        result
     }
 }

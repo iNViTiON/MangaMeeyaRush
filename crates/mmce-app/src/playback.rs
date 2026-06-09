@@ -78,7 +78,11 @@ impl Playback {
         }
         self.last_tick = now;
 
-        let at_end = if forward { cursor + 1 >= len } else { cursor == 0 };
+        let at_end = if forward {
+            cursor + 1 >= len
+        } else {
+            cursor == 0
+        };
         if at_end {
             match self.loop_mode {
                 LoopMode::Off => {
@@ -105,7 +109,11 @@ impl Playback {
             return None;
         }
         let since = Instant::now().saturating_duration_since(self.last_tick);
-        Some(self.interval.saturating_sub(since).max(Duration::from_millis(50)))
+        Some(
+            self.interval
+                .saturating_sub(since)
+                .max(Duration::from_millis(50)),
+        )
     }
 }
 

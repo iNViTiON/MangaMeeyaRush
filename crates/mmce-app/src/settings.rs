@@ -45,11 +45,7 @@ pub fn show(ctx: &Context, app: &mut App) {
                 ui.selectable_value(&mut app.settings_dialog.tab, Tab::General, "General");
                 ui.selectable_value(&mut app.settings_dialog.tab, Tab::View, "View");
                 ui.selectable_value(&mut app.settings_dialog.tab, Tab::Playback, "Playback");
-                ui.selectable_value(
-                    &mut app.settings_dialog.tab,
-                    Tab::Appearance,
-                    "Appearance",
-                );
+                ui.selectable_value(&mut app.settings_dialog.tab, Tab::Appearance, "Appearance");
             });
             ui.separator();
 
@@ -62,9 +58,7 @@ pub fn show(ctx: &Context, app: &mut App) {
 
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Close").clicked()
-                    || ctx.input(|i| i.key_pressed(Key::Escape))
-                {
+                if ui.button("Close").clicked() || ctx.input(|i| i.key_pressed(Key::Escape)) {
                     close = true;
                 }
             });
@@ -182,6 +176,9 @@ fn draw_appearance(ui: &mut egui::Ui, app: &mut App) {
     ui.checkbox(&mut app.overlays.seekbar, "Show seek bar");
     ui.horizontal(|ui| {
         ui.label("Picture-cache size:");
-        ui.add(Slider::new(&mut app.settings.cache.picture_cache_size, 16..=512));
+        ui.add(Slider::new(
+            &mut app.settings.cache.picture_cache_size,
+            16..=512,
+        ));
     });
 }

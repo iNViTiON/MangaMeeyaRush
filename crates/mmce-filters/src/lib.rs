@@ -59,7 +59,12 @@ pub struct ClipRect {
 
 impl ClipRect {
     pub fn full() -> Self {
-        Self { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }
+        Self {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+        }
     }
 
     pub fn clamp(self) -> Self {
@@ -91,7 +96,11 @@ pub struct AdjustParams {
 
 impl AdjustParams {
     pub fn identity() -> Self {
-        Self { brightness: 0.0, contrast: 1.0, gamma: 1.0 }
+        Self {
+            brightness: 0.0,
+            contrast: 1.0,
+            gamma: 1.0,
+        }
     }
 
     pub fn is_identity(&self) -> bool {
@@ -113,7 +122,11 @@ pub struct SharpenParams {
 
 impl SharpenParams {
     pub fn identity() -> Self {
-        Self { amount: 0.0, radius: 1.0, threshold: 0 }
+        Self {
+            amount: 0.0,
+            radius: 1.0,
+            threshold: 0,
+        }
     }
 
     pub fn is_identity(&self) -> bool {
@@ -198,8 +211,12 @@ fn apply_clip(img: DynamicImage, rect: ClipRect) -> DynamicImage {
     let (w, h) = img.dimensions();
     let x = (rect.x * w as f32).round() as u32;
     let y = (rect.y * h as f32).round() as u32;
-    let cw = ((rect.w * w as f32).round() as u32).max(1).min(w - x.min(w - 1));
-    let ch = ((rect.h * h as f32).round() as u32).max(1).min(h - y.min(h - 1));
+    let cw = ((rect.w * w as f32).round() as u32)
+        .max(1)
+        .min(w - x.min(w - 1));
+    let ch = ((rect.h * h as f32).round() as u32)
+        .max(1)
+        .min(h - y.min(h - 1));
     img.crop_imm(x, y, cw, ch)
 }
 
@@ -249,9 +266,9 @@ fn apply_sharpen(img: DynamicImage, s: SharpenParams) -> DynamicImage {
     let mut out = RgbaImage::new(w, h);
     for (dst_px, (a, b)) in out.pixels_mut().zip(src.pixels().zip(sharp.pixels())) {
         let mut chan = [0u8; 4];
-        for i in 0..3 {
+        for (i, c) in chan.iter_mut().enumerate().take(3) {
             let blended = a.0[i] as f32 + (b.0[i] as f32 - a.0[i] as f32) * amount;
-            chan[i] = blended.round().clamp(0.0, 255.0) as u8;
+            *c = blended.round().clamp(0.0, 255.0) as u8;
         }
         chan[3] = a.0[3];
         *dst_px = Rgba(chan);
@@ -342,8 +359,8 @@ mod tests {
     #[test]
     fn rotate_360_is_identity_dims() {
         let img = sample_rgb(40, 60);
-        let out = FilterOp::Rotate(Rotation::Deg90)
-            .apply(FilterOp::Rotate(Rotation::Deg270).apply(img));
+        let out =
+            FilterOp::Rotate(Rotation::Deg90).apply(FilterOp::Rotate(Rotation::Deg270).apply(img));
         assert_dims(&out, 40, 60);
     }
 
@@ -356,7 +373,13 @@ mod tests {
 
     #[test]
     fn clip_clamps_out_of_range() {
-        let c = ClipRect { x: -0.5, y: 1.5, w: 2.0, h: 3.0 }.clamp();
+        let c = ClipRect {
+            x: -0.5,
+            y: 1.5,
+            w: 2.0,
+            h: 3.0,
+        }
+        .clamp();
         assert!(c.x >= 0.0 && c.y <= 1.0);
         assert!(c.x + c.w <= 1.0 + 1e-4);
         assert!(c.y + c.h <= 1.0 + 1e-4);
@@ -372,7 +395,13 @@ mod tests {
     #[test]
     fn clip_half_produces_half_size() {
         let img = sample_rgb(100, 200);
-        let out = FilterOp::Clip(ClipRect { x: 0.0, y: 0.0, w: 0.5, h: 1.0 }).apply(img);
+        let out = FilterOp::Clip(ClipRect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.5,
+            h: 1.0,
+        })
+        .apply(img);
         assert_dims(&out, 50, 200);
     }
 

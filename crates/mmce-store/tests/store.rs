@@ -66,7 +66,10 @@ fn setting_round_trip() {
     store.set_setting("theme", "dark").unwrap();
     assert_eq!(store.get_setting("theme").unwrap().as_deref(), Some("dark"));
     store.set_setting("theme", "light").unwrap();
-    assert_eq!(store.get_setting("theme").unwrap().as_deref(), Some("light"));
+    assert_eq!(
+        store.get_setting("theme").unwrap().as_deref(),
+        Some("light")
+    );
 }
 
 #[test]

@@ -47,15 +47,11 @@ impl ConfirmDelete {
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Delete").clicked()
-                        || ctx.input(|i| i.key_pressed(Key::Enter))
-                    {
+                    if ui.button("Delete").clicked() || ctx.input(|i| i.key_pressed(Key::Enter)) {
                         confirm = true;
                         close = true;
                     }
-                    if ui.button("Cancel").clicked()
-                        || ctx.input(|i| i.key_pressed(Key::Escape))
-                    {
+                    if ui.button("Cancel").clicked() || ctx.input(|i| i.key_pressed(Key::Escape)) {
                         close = true;
                     }
                 });
@@ -111,9 +107,7 @@ impl RenameDialog {
                         }
                         close = true;
                     }
-                    if ui.button("Cancel").clicked()
-                        || ctx.input(|i| i.key_pressed(Key::Escape))
-                    {
+                    if ui.button("Cancel").clicked() || ctx.input(|i| i.key_pressed(Key::Escape)) {
                         close = true;
                     }
                 });

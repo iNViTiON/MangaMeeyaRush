@@ -24,7 +24,7 @@ pub enum ConfigError {
 
 /// High-level typed settings pulled from the INI. We load only what we actually
 /// honour; everything else is preserved verbatim on save via `extra`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     pub general: General,
     pub view: ViewMode,
@@ -176,19 +176,6 @@ impl Default for Scroll {
     }
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            general: General::default(),
-            view: ViewMode::default(),
-            scale: ScaleMode::default(),
-            cache: Cache::default(),
-            scroll: Scroll::default(),
-            extra: Ini::default(),
-        }
-    }
-}
-
 impl Settings {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         if !path.exists() {
@@ -297,7 +284,11 @@ impl Settings {
         // landscape pages — we only emit 1 when we're in Auto.
         vm.set(
             "AutoPageMode",
-            if self.view.page_mode == PageMode::Auto { "1" } else { "0" },
+            if self.view.page_mode == PageMode::Auto {
+                "1"
+            } else {
+                "0"
+            },
         );
         vm.set(
             "BindDir",
@@ -331,7 +322,10 @@ impl Settings {
         sm.set("OptionalScale", format!("{}", self.scale.optional_scale));
 
         let c = ini.section_mut("Cache");
-        c.set("PictureCacheSize", self.cache.picture_cache_size.to_string());
+        c.set(
+            "PictureCacheSize",
+            self.cache.picture_cache_size.to_string(),
+        );
         c.set("FileCacheSize", self.cache.file_cache_size.to_string());
         c.set("PreLoad", bool_i(self.cache.preload));
         c.set("LoadScaled", bool_i(self.cache.load_scaled));
@@ -346,7 +340,11 @@ impl Settings {
 }
 
 fn bool_i(b: bool) -> &'static str {
-    if b { "1" } else { "0" }
+    if b {
+        "1"
+    } else {
+        "0"
+    }
 }
 
 fn decode_any(bytes: &[u8]) -> Result<String, ConfigError> {
@@ -372,6 +370,12 @@ fn decode_any(bytes: &[u8]) -> Result<String, ConfigError> {
 // Re-export for test convenience.
 pub fn settings_from_string(text: &str) -> Settings {
     Settings::from_ini(Ini::parse(text))
+}
+
+// Avoid unused warning for BTreeMap import when tests are off
+#[allow(dead_code)]
+fn _force_use() -> BTreeMap<(), ()> {
+    BTreeMap::new()
 }
 
 #[cfg(test)]
@@ -418,10 +422,4 @@ mod tests {
         assert!(serialized.contains("[Weird]"));
         assert!(serialized.contains("Key=hello"));
     }
-}
-
-// Avoid unused warning for BTreeMap import when tests are off
-#[allow(dead_code)]
-fn _force_use() -> BTreeMap<(), ()> {
-    BTreeMap::new()
 }
