@@ -177,16 +177,9 @@ impl ThumbnailCache {
         }));
         let queue = Arc::new((Mutex::new(Queue::new()), Condvar::new()));
         let gen = Arc::new(Mutex::new(0u64));
-        // One core for UI, the rest for thumbs. Floor of 4 so even a
-        // 2-core box parallelizes decode a bit; ceiling of 12 so big
-        // workstations don't context-switch themselves to death. Past
-        // ~12 threads thumb decoding is memory-bandwidth-bound and extra
-        // workers just thrash cache.
-        let n = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .saturating_sub(1)
-            .clamp(4, 12);
+        // Worker-pool size: ~1.5x cores by default, env-overridable. See
+        // worker_pool_size() for the rationale and the MMCE_THUMB_WORKERS knob.
+        let n = worker_pool_size();
         let workers = (0..n)
             .map(|i| spawn_worker(i, queue.clone(), inner.clone(), ctx.clone(), gen.clone()))
             .collect();
@@ -372,6 +365,36 @@ fn spawn_worker(
             ctx.request_repaint();
         })
         .expect("spawn thumbnail worker")
+}
+
+/// Worker-pool size for thumbnail decoding. Defaults to ~1.5x cores (cores +
+/// cores/2). Cold thumbnail scans are I/O-wait-bound — a worker blocks on a cold
+/// archive read and idles its core — so to keep all C cores busy when a fraction
+/// `rho` of each cover's wall-time is blocking I/O you need ~C/(1-rho) threads:
+/// a MULTIPLIER on core count, not a fixed addend. Measured rho ~= 0.4 on native
+/// cold (the cold floor ~= the warm time), implying a ~1.66x optimum; 1.5x
+/// captures most of it while leaving the eframe UI thread some headroom. Warm
+/// throughput is flat out to 4x cores, so the oversubscription is ~free when
+/// reads hit the page cache. Floor 4 for tiny boxes; ceiling 16 as a safety cap
+/// (memory + UI thread) on huge machines.
+///
+/// `MMCE_THUMB_WORKERS` overrides it: parsed as usize, ignored if unset,
+/// non-numeric, or zero, and clamped to [1, 64] so a typo can't spawn thousands
+/// of threads. Read fresh on every `ThumbnailCache::new`, so it takes effect on
+/// the next cache creation rather than retroactively on a live pool. Push it
+/// higher on slow / FUSE storage, where cold reads block longer (larger `rho`)
+/// and there is more idle to reclaim.
+fn worker_pool_size() -> usize {
+    let env_override = std::env::var_os("MMCE_THUMB_WORKERS")
+        .and_then(|v| v.to_str().and_then(|s| s.trim().parse::<usize>().ok()))
+        .filter(|&n| n > 0)
+        .map(|n| n.clamp(1, 64));
+    env_override.unwrap_or_else(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        (cores * 3 / 2).clamp(4, 16)
+    })
 }
 
 fn decode_cover(path: &Path, thumb_size: u32) -> Option<Decoded> {
