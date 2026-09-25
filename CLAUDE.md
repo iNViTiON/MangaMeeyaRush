@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-**mmce** — a cross-platform Rust port of the Japanese freeware manga reader **MangaMeeya CE** (Win32, 2005-2007, no source). The legacy binaries + a reference `MangaMeeyaCE.ini` live under `legacy/` for behavior lookup; this repo rebuilds the viewer on `eframe`/`egui` with a Cargo workspace of focused crates.
+**mmce** — a cross-platform Rust port of the Japanese freeware manga reader **MangaMeeya CE** (Win32, 2005-2007, no source). This repo rebuilds the viewer on `eframe`/`egui` with a Cargo workspace of focused crates.
 
 ## Common commands
 
@@ -69,7 +69,7 @@ crates/
 - **Archive reads are pooled for parallelism.** `ZipSource` / `SevenzSource` own `Mutex<Vec<Archive>>` pools (cap 8) so N decoder workers can inflate concurrently. Never reintroduce a single-instance `Mutex<ZipArchive<File>>` — it serializes the inflate path and NVMe sits idle.
 - **`tex` in `PageCache` must stay bounded.** It's a `TexLru` mirroring the CPU cache's capacity; if someone turns it back into an unbounded `HashMap<usize, TextureHandle>` VRAM leaks a texture per visited page.
 - **Session state is intentionally ephemeral.** `attach_store_book` does NOT auto-resume to `last_page` on open — users asked for explicit nav only. Bookmarks + the History dialog are the supported path back to a spot.
-- **Legacy INI keys cannot be renamed.** `mmce-config/src/lib.rs::from_ini`/`to_ini` round-trip the exact casing in `legacy/MangaMeeyaCE.ini` so existing configs don't get mangled. The `extra: Ini` field stashes sections we don't interpret so save re-emits them.
+- **Legacy INI keys cannot be renamed.** `mmce-config/src/lib.rs::from_ini`/`to_ini` round-trip the exact casing used by `MangaMeeyaCE.ini` so existing configs don't get mangled. The `extra: Ini` field stashes sections we don't interpret so save re-emits them.
 
 ### SIMD / performance levers already in place
 

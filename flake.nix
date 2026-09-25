@@ -42,7 +42,7 @@
 
         libraryPath = pkgs.lib.makeLibraryPath runtimeLibs;
 
-        # Keep the source tree small: drop build/output/reference dirs that the
+        # Keep the source tree small: drop build/output dirs that the
         # crate build never reads (.cargo/config.toml IS kept — it carries the
         # target-cpu=native SIMD flags).
         src = pkgs.lib.cleanSourceWith {
@@ -50,8 +50,7 @@
           filter = path: type:
             let rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
             in !(pkgs.lib.hasPrefix "target" rel
-              || pkgs.lib.hasPrefix "outputs" rel
-              || pkgs.lib.hasPrefix "legacy" rel);
+              || pkgs.lib.hasPrefix "outputs" rel);
         };
 
         mmce = rustPlatform.buildRustPackage {

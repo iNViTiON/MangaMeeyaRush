@@ -4,9 +4,6 @@ A cross-platform manga / image viewer modelled on the old Japanese freeware
 **MangaMeeya CE** (2005–2007). That binary is Win32-only and has no source
 code; this repo rebuilds its behaviour in Rust on top of [eframe/egui][egui].
 
-The original's `.exe`, DLLs, and a real `MangaMeeyaCE.ini` (useful as a
-ground-truth reference) live under [`legacy/`](legacy/).
-
 ## What's in the box
 
 - Loose-image folders, `.zip` / `.cbz`, `.7z` / `.cb7` archives
@@ -128,9 +125,7 @@ long as `mmce` doesn't crash before the timeout kills it.
 
 ## License
 
-MIT. The legacy binaries bundled under `legacy/` are the original anonymous
-author's freeware and are not covered by this license — they are included
-only as reference material for reverse-engineering the behaviour this
-port targets.
+MIT. MangaMeeya CE itself is the original anonymous author's freeware and
+is not covered by this license; none of it is redistributed here.
 
 [egui]: https://github.com/emilk/egui
