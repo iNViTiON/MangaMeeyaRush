@@ -12,7 +12,7 @@ code; this repo rebuilds its behaviour in Rust on top of [eframe/egui][egui].
 - Natural sort (`page 2 < page 10`)
 - Fit / fit-width / fit-height / 100% / custom zoom, with *no-zoom-in* cap
 - Background prefetch + LRU page cache
-- Keyboard bindings matching the readme:
+- Keyboard bindings matching the original app:
   - `←` / `→` — previous / next spread
   - `Shift+←` / `Shift+→` — step a single page
   - `/` / `?` — skip: pin the prior page, slide only the later page of a 2-up spread (`?` reverses)
