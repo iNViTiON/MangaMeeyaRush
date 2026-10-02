@@ -1,7 +1,7 @@
 //! 7z / cb7 archive as a PageSource.
 //!
-//! Enumeration walks the archive once at open via
-//! `ArchiveReader::for_each_entries` to collect image entry names. Reads
+//! Enumeration reads entry names from the archive header only — nothing is
+//! decompressed at open, however large or solid the archive. Reads
 //! use `ArchiveReader::read_file` on a pooled reader instance so decoder
 //! workers can decompress concurrently — each instance maintains its own
 //! solid-block state, so multiple readers in parallel do give real
@@ -33,24 +33,21 @@ struct Entry {
 
 impl SevenzSource {
     pub fn open(path: &Path) -> Result<Self, CodecError> {
-        let mut reader = ArchiveReader::open(path, Password::empty())
-            .map_err(|e| CodecError::Sevenz(e.to_string()))?;
+        let reader = open_reader(path)?;
 
-        let mut entries = Vec::new();
-        reader
-            .for_each_entries(|entry, r| {
-                if !entry.is_directory && is_image_path(Path::new(entry.name())) {
-                    entries.push(Entry {
-                        archive_name: entry.name().to_string(),
-                        display: entry.name().to_string(),
-                    });
-                }
-                // We still need to consume the reader stream even for files we
-                // skip, to keep the solid-block decoder advancing correctly.
-                std::io::copy(r, &mut std::io::sink()).map_err(sevenz_rust2::Error::from)?;
-                Ok(true)
+        // The header already lists every entry. Walking `for_each_entries`
+        // instead would push the whole archive through the solid-block
+        // decoder just to learn the names.
+        let mut entries: Vec<Entry> = reader
+            .archive()
+            .files
+            .iter()
+            .filter(|e| !e.is_directory() && is_image_path(Path::new(e.name())))
+            .map(|e| Entry {
+                archive_name: e.name().to_string(),
+                display: e.name().to_string(),
             })
-            .map_err(|e| CodecError::Sevenz(e.to_string()))?;
+            .collect();
 
         entries.sort_by(|a, b| natord::compare(&a.display, &b.display));
 
@@ -64,7 +61,7 @@ impl SevenzSource {
             name,
             path: path.to_path_buf(),
             entries,
-            // Seed the pool with the reader we just used for enumeration.
+            // Seed the pool with the reader we just opened.
             pool: Mutex::new(vec![reader]),
         })
     }
@@ -73,8 +70,7 @@ impl SevenzSource {
         if let Some(r) = self.pool.lock().ok().and_then(|mut p| p.pop()) {
             return Ok(r);
         }
-        ArchiveReader::open(&self.path, Password::empty())
-            .map_err(|e| CodecError::Sevenz(e.to_string()))
+        open_reader(&self.path)
     }
 
     fn release(&self, reader: ArchiveReader<std::fs::File>) {
@@ -84,6 +80,18 @@ impl SevenzSource {
             }
         }
     }
+}
+
+fn open_reader(path: &Path) -> Result<ArchiveReader<std::fs::File>, CodecError> {
+    let mut reader = ArchiveReader::open(path, Password::empty())
+        .map_err(|e| CodecError::Sevenz(e.to_string()))?;
+    // sevenz-rust2 defaults to one LZMA2 decode thread per core on every
+    // reader. Parallelism here comes from the pool (one reader per decoder
+    // worker), so per-read threads only oversubscribe — and the
+    // multi-threaded decoder deadlocks on corrupt input, wedging the worker
+    // forever (see `sevenz_open_does_not_decompress`).
+    reader.set_thread_count(1);
+    Ok(reader)
 }
 
 impl PageSource for SevenzSource {

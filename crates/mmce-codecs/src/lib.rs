@@ -184,15 +184,13 @@ pub(crate) fn read_all(path: &Path) -> Result<Vec<u8>, CodecError> {
     Ok(buf)
 }
 
-/// Fast path for "give me the cover image bytes" — avoids the full
-/// `open_source` + enumerate pipeline. Primarily a win for 7z: the normal
-/// `SevenzSource::open` walks every entry through the solid-block decoder
-/// just to list them, which can take seconds on big archives. Here we stop
-/// after the first image.
+/// "Give me the cover image bytes": page 0 of the folder / archive, or the
+/// file itself for a loose image (`open_source` would open its parent
+/// folder and hand back that folder's first page instead).
 ///
-/// For folders and ZIPs the savings vs. `open_source(path)?.read(0)` are
-/// small (central-directory scan is already cheap), but going through this
-/// entry point keeps the caller simple.
+/// Every source enumerates cheaply — ZIP from the central directory, 7z from
+/// the archive header — so for containers this is just open + `read(0)`, and
+/// the explorer cover always matches the book's first page.
 pub fn cover_image(path: &Path) -> Option<Vec<u8>> {
     if path.is_dir() {
         folder_cover(path)
@@ -224,9 +222,8 @@ fn folder_cover(dir: &Path) -> Option<Vec<u8>> {
 }
 
 fn zip_cover(path: &Path) -> Option<Vec<u8>> {
-    // ZipArchive's central directory scan is O(entries) seek+read but
-    // compressed bytes are only touched for the entry we actually read.
-    // Delegate to the normal source — already minimal.
+    // The central directory is read in one buffered pass; only the cover's
+    // local header and bytes are touched. Delegate to the normal source.
     let src = zip_src::ZipSource::open(path).ok()?;
     if src.is_empty() {
         return None;
@@ -235,26 +232,13 @@ fn zip_cover(path: &Path) -> Option<Vec<u8>> {
 }
 
 fn sevenz_cover(path: &Path) -> Option<Vec<u8>> {
-    use sevenz_rust2::{ArchiveReader, Password};
-    let mut reader = ArchiveReader::open(path, Password::empty()).ok()?;
-    let mut cover: Option<Vec<u8>> = None;
-    let _ = reader.for_each_entries(|entry, r| {
-        if cover.is_some() {
-            // Already got the cover — stop iteration.
-            return Ok(false);
-        }
-        if !entry.is_directory && is_image_path(Path::new(entry.name())) {
-            let mut buf = Vec::with_capacity(entry.size() as usize);
-            std::io::copy(r, &mut buf).map_err(sevenz_rust2::Error::from)?;
-            cover = Some(buf);
-            return Ok(false);
-        }
-        // Consume the stream even for non-image entries — the solid-block
-        // decoder must stay in sync.
-        std::io::copy(r, &mut std::io::sink()).map_err(sevenz_rust2::Error::from)?;
-        Ok(true)
-    });
-    cover
+    // Enumeration is header-only, and `read_file` decodes just the block
+    // holding the cover, up to the cover — never earlier blocks.
+    let src = sevenz_src::SevenzSource::open(path).ok()?;
+    if src.is_empty() {
+        return None;
+    }
+    src.read(0).ok()
 }
 
 // Avoid unused warning from `Mutex` import when tests are off.

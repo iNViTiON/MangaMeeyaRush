@@ -149,3 +149,93 @@ fn zip_source_supports_concurrent_reads() {
         h.join().unwrap();
     }
 }
+
+/// Write a 7z whose archive order is deliberately not natural order, with a
+/// non-image and a directory mixed in. `solid` packs everything into one
+/// block (the expensive case for random access).
+fn write_7z(path: &std::path::Path, solid: bool) -> Vec<(String, Vec<u8>)> {
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter, SourceReader};
+    let files: Vec<(String, Vec<u8>)> = vec![
+        ("vol/10.png".into(), make_png(10)),
+        ("vol/2.png".into(), make_png(2)),
+        ("readme.txt".into(), b"not a page".to_vec()),
+        ("vol/1.png".into(), make_png(1)),
+    ];
+    let mut w = ArchiveWriter::create(path).unwrap();
+    w.push_archive_entry::<&[u8]>(ArchiveEntry::new_directory("vol"), None)
+        .unwrap();
+    if solid {
+        let entries = files
+            .iter()
+            .map(|(n, _)| ArchiveEntry::new_file(n))
+            .collect();
+        let readers = files
+            .iter()
+            .map(|(_, d)| SourceReader::new(d.as_slice()))
+            .collect();
+        w.push_archive_entries(entries, readers).unwrap();
+    } else {
+        for (n, d) in &files {
+            w.push_archive_entry(ArchiveEntry::new_file(n), Some(d.as_slice()))
+                .unwrap();
+        }
+    }
+    w.finish().unwrap();
+    files
+}
+
+#[test]
+fn sevenz_source_lists_naturally_sorted_images_and_reads_them() {
+    for solid in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.cb7");
+        let files = write_7z(&path, solid);
+
+        let src = open_source(&path).unwrap();
+        let names: Vec<_> = (0..src.len()).map(|i| src.entry_name(i).unwrap()).collect();
+        assert_eq!(
+            names,
+            ["vol/1.png", "vol/2.png", "vol/10.png"],
+            "solid={solid}"
+        );
+        assert_eq!(src.read(2).unwrap(), files[0].1, "solid={solid}");
+
+        // The explorer cover is the book's first page, not the first image
+        // in archive order (vol/10.png here).
+        let cover = mmce_codecs::cover_image(&path).unwrap();
+        assert_eq!(cover, files[3].1, "solid={solid}");
+    }
+}
+
+#[test]
+fn sevenz_open_does_not_decompress() {
+    // Corrupt the packed data (it starts right after the 32-byte signature
+    // header) but leave the end-of-file header intact. Listing pages must
+    // still work: open reads the header only. Decompressing at open — as
+    // enumeration used to — fails on this archive.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("book.cb7");
+    write_7z(&path, true);
+    let mut bytes = fs::read(&path).unwrap();
+    for b in &mut bytes[64..256] {
+        *b ^= 0x5a;
+    }
+    fs::write(&path, &bytes).unwrap();
+
+    let src = open_source(&path).expect("open must not touch packed data");
+    assert_eq!(src.len(), 3);
+
+    // Reading the corrupt pages must error, not hang: sevenz-rust2's
+    // multi-threaded LZMA2 decoder deadlocks here, which is why readers are
+    // pinned to `set_thread_count(1)`. Watchdog so a regression fails
+    // instead of wedging the test run.
+    let src: std::sync::Arc<dyn mmce_codecs::PageSource> = std::sync::Arc::from(src);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send((0..src.len()).any(|i| src.read(i).is_err()));
+    });
+    let any_err = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("7z decode of corrupt data hung — keep set_thread_count(1)");
+    assert!(any_err, "fixture should really be corrupt");
+}
