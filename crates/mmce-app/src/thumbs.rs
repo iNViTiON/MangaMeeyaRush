@@ -10,11 +10,16 @@
 //!    reads are parallel on NVMe), decode to a small RGBA buffer using a
 //!    fast box-filter thumbnailer, and hand the pixels to the UI thread via
 //!    the staging map. The UI uploads them as egui textures on next repaint.
+//!
+//! Textures remember the thumb size they were decoded for. When the tile size
+//! changes the old texture keeps being drawn (scaled) while a decode at the
+//! new size runs, so Ctrl± never blanks the grid.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use egui::{ColorImage, Context, TextureHandle, TextureOptions};
 use image::GenericImageView;
@@ -23,6 +28,13 @@ use mmce_codecs::{cover_image, decode_cover_image};
 struct Decoded {
     size: [usize; 2],
     pixels: Vec<u8>,
+}
+
+/// A worker result waiting for the UI thread. `result` is `None` when the
+/// path couldn't be decoded.
+struct Staged {
+    thumb_size: u32,
+    result: Option<Decoded>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,11 +70,22 @@ impl Queue {
         }
     }
 
-    fn enqueue(&mut self, req: Request) {
-        if let Some(pos) = self.items.iter().position(|m| match m {
-            Msg::Request(r) => r.path == req.path,
+    fn position(&self, path: &Path) -> Option<usize> {
+        self.items.iter().position(|m| match m {
+            Msg::Request(r) => r.path == path,
             Msg::Shutdown => false,
-        }) {
+        })
+    }
+
+    fn enqueue(&mut self, req: Request) {
+        let pos = self.position(&req.path);
+        self.merge_or_push(pos, req);
+    }
+
+    /// `pos` is where a request for the same path already sits, if any: merge
+    /// into it (keeping the higher priority, adopting the newer size/gen).
+    fn merge_or_push(&mut self, pos: Option<usize>, req: Request) {
+        if let Some(pos) = pos {
             if let Some(Msg::Request(old)) = self.items.remove(pos) {
                 let priority = if old.priority == Priority::High || req.priority == Priority::High {
                     Priority::High
@@ -80,6 +103,31 @@ impl Queue {
             }
         }
         self.push(req);
+    }
+
+    /// Bump an already-queued request for `req.path` to high priority,
+    /// adopting `req`'s thumb size. Returns `false` (and queues nothing) when
+    /// the path isn't in the queue, i.e. a worker already has it in flight.
+    fn promote(&mut self, req: Request) -> bool {
+        let pos = self.position(&req.path);
+        if pos.is_some() {
+            self.merge_or_push(pos, req);
+        }
+        pos.is_some()
+    }
+
+    /// Remove every queued request (shutdown markers stay) and return their
+    /// paths.
+    fn drain_requests(&mut self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        self.items.retain(|m| match m {
+            Msg::Request(r) => {
+                paths.push(r.path.clone());
+                false
+            }
+            Msg::Shutdown => true,
+        });
+        paths
     }
 
     fn push(&mut self, req: Request) {
@@ -106,12 +154,23 @@ struct Inner {
     /// thread. Staging buffer — the UI drains it on every repaint, so we
     /// don't cap it. Capping here races UI drainage and causes visible
     /// tiles to bounce between Ready → Pending.
-    decoded: HashMap<PathBuf, Option<Decoded>>,
+    decoded: HashMap<PathBuf, Staged>,
 }
 
 struct TexEntry {
     handle: Option<TextureHandle>,
+    /// Thumb size the texture was decoded for. A mismatch with the size the
+    /// UI now wants means "draw it anyway, but re-decode".
+    thumb_size: u32,
     sort: u64,
+}
+
+impl TexEntry {
+    /// Nothing more to decode for `thumb_size`: either the texture matches,
+    /// or the path failed (failure doesn't depend on size).
+    fn satisfies(&self, thumb_size: u32) -> bool {
+        self.handle.is_none() || self.thumb_size == thumb_size
+    }
 }
 
 struct TexStore {
@@ -133,10 +192,11 @@ impl TexStore {
         })
     }
 
-    fn insert(&mut self, path: PathBuf, handle: Option<TextureHandle>) {
+    fn insert(&mut self, path: PathBuf, handle: Option<TextureHandle>, thumb_size: u32) {
         self.counter += 1;
         let entry = TexEntry {
             handle,
+            thumb_size,
             sort: self.counter,
         };
         if self.map.len() >= self.capacity && !self.map.contains_key(&path) {
@@ -151,10 +211,6 @@ impl TexStore {
         }
         self.map.insert(path, entry);
     }
-
-    fn clear(&mut self) {
-        self.map.clear();
-    }
 }
 
 pub struct ThumbnailCache {
@@ -164,8 +220,8 @@ pub struct ThumbnailCache {
     tex: Mutex<TexStore>,
     worker_count: usize,
     _workers: Vec<thread::JoinHandle<()>>,
-    /// Incremented on `clear()` — worker results from a previous generation
-    /// are discarded so the fresh cache only contains the new thumb size.
+    /// Incremented on `cancel_dir()` — worker results from a previous
+    /// generation are discarded instead of piling up in the staging map.
     gen: Arc<Mutex<u64>>,
 }
 
@@ -201,71 +257,99 @@ impl ThumbnailCache {
         }
     }
 
-    /// Invalidate all cached thumbnails — used when the tile/thumb size
-    /// changes and we need to re-decode at the new resolution.
-    pub fn clear(&self) {
-        {
-            let mut g = self.inner.lock().unwrap();
-            g.decoded.clear();
-            g.pending.clear();
+    /// Drop every queued (not yet started) request. Used when the thumb size
+    /// changes: the queue holds old-size work, and the next frame re-requests
+    /// what's on screen at the new size. Textures stay — they keep being drawn
+    /// scaled until the new decode lands.
+    pub fn cancel_queued(&self) {
+        let dropped = {
+            let (lock, _) = &*self.queue;
+            lock.lock().unwrap().drain_requests()
+        };
+        let mut g = self.inner.lock().unwrap();
+        for p in dropped {
+            g.pending.remove(&p);
         }
-        self.tex.lock().unwrap().clear();
+    }
+
+    /// The explorer moved to another directory: drop the old directory's
+    /// queued prefetch backlog (so the new one isn't stuck behind it) and its
+    /// decoded-but-never-shown results (so they don't accumulate across a
+    /// session). Results still in flight are discarded when they land.
+    /// Uploaded textures are kept, so going back shows seen tiles instantly.
+    pub fn cancel_dir(&self) {
+        self.cancel_queued();
+        // Bump under the inner lock: a worker checks gen and inserts while
+        // holding it, so no stale result can slip in after the clear.
+        let mut g = self.inner.lock().unwrap();
         *self.gen.lock().unwrap() += 1;
+        g.decoded.clear();
     }
 
     /// Returns a texture for `path` if decoded; otherwise schedules a decode
     /// and returns `Pending`. `Failed` means the path couldn't decode — the
     /// UI should fall back to an icon.
     pub fn thumbnail(&self, path: &Path, thumb_size: u32) -> ThumbStatus {
-        if let Some(entry) = self.tex.lock().unwrap().get(path) {
-            return match &entry.handle {
-                Some(t) => ThumbStatus::Ready(t.clone()),
-                None => ThumbStatus::Failed,
-            };
+        if let Some(status) = self.tex_status(path, thumb_size, true) {
+            return status;
         }
 
-        let decoded_state: Option<Option<Decoded>> = {
-            let mut g = self.inner.lock().unwrap();
-            g.decoded.remove(path)
-        };
-        if let Some(state) = decoded_state {
-            match state {
-                Some(d) => {
-                    // Premultiplied skips compositor alpha math. Covers
-                    // are opaque (JPEG has no alpha; PNG covers are
-                    // overwhelmingly opaque) so the result is identical.
-                    let ci = ColorImage::from_rgba_premultiplied(d.size, &d.pixels);
-                    let handle = self.ctx.load_texture(
-                        format!("mmce_thumb_{}", path.display()),
-                        ci,
-                        TextureOptions::LINEAR,
-                    );
-                    self.tex
-                        .lock()
-                        .unwrap()
-                        .insert(path.to_path_buf(), Some(handle.clone()));
-                    return ThumbStatus::Ready(handle);
-                }
-                None => {
-                    self.tex.lock().unwrap().insert(path.to_path_buf(), None);
-                    return ThumbStatus::Failed;
-                }
+        let staged = self.inner.lock().unwrap().decoded.remove(path);
+        if let Some(staged) = staged {
+            let handle = staged.result.map(|d| {
+                // Premultiplied skips compositor alpha math. Covers are
+                // opaque (JPEG has no alpha; PNG covers are overwhelmingly
+                // opaque) so the result is identical.
+                let ci = ColorImage::from_rgba_premultiplied(d.size, &d.pixels);
+                self.ctx.load_texture(
+                    format!("mmce_thumb_{}", path.display()),
+                    ci,
+                    TextureOptions::LINEAR,
+                )
+            });
+            self.tex
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), handle, staged.thumb_size);
+            if let Some(status) = self.tex_status(path, thumb_size, true) {
+                return status;
             }
         }
 
         self.enqueue(path, thumb_size, Priority::High);
-        ThumbStatus::Pending
+        // A texture at another size (tile size just changed) beats a
+        // placeholder: draw it scaled until the re-decode lands.
+        self.tex_status(path, thumb_size, false)
+            .unwrap_or(ThumbStatus::Pending)
+    }
+
+    /// Status from the texture store. With `exact`, only a texture that
+    /// needs no further decode counts; otherwise any texture does.
+    fn tex_status(&self, path: &Path, thumb_size: u32, exact: bool) -> Option<ThumbStatus> {
+        let mut tex = self.tex.lock().unwrap();
+        let entry = tex.get(path)?;
+        if exact && !entry.satisfies(thumb_size) {
+            return None;
+        }
+        Some(match &entry.handle {
+            Some(t) => ThumbStatus::Ready(t.clone()),
+            None => ThumbStatus::Failed,
+        })
     }
 
     /// Ask the worker pool to decode `path` in the background at low
     /// priority. Used to prefetch adjacent tiles so the user doesn't see
     /// spinners when they scroll.
     pub fn prefetch(&self, path: &Path, thumb_size: u32) {
-        if self.tex.lock().unwrap().map.contains_key(path) {
-            return;
+        if let Some(e) = self.tex.lock().unwrap().map.get(path) {
+            if e.satisfies(thumb_size) {
+                return;
+            }
         }
-        if self.inner.lock().unwrap().decoded.contains_key(path) {
-            return;
+        if let Some(s) = self.inner.lock().unwrap().decoded.get(path) {
+            if s.result.is_none() || s.thumb_size == thumb_size {
+                return;
+            }
         }
         self.enqueue(path, thumb_size, Priority::Low);
     }
@@ -280,26 +364,26 @@ impl ThumbnailCache {
                 true
             }
         };
-        let req_gen = *self.gen.lock().unwrap();
+        if !newly_queued && priority == Priority::Low {
+            return;
+        }
+        let req = Request {
+            path: path.to_path_buf(),
+            thumb_size,
+            gen: *self.gen.lock().unwrap(),
+            priority,
+        };
         let (lock, cvar) = &*self.queue;
         let mut q = lock.lock().unwrap();
         if newly_queued {
-            q.enqueue(Request {
-                path: path.to_path_buf(),
-                thumb_size,
-                gen: req_gen,
-                priority,
-            });
+            q.enqueue(req);
             cvar.notify_one();
-        } else if priority == Priority::High {
-            // Existing request — bump priority so it gets served next.
-            q.enqueue(Request {
-                path: path.to_path_buf(),
-                thumb_size,
-                gen: req_gen,
-                priority,
-            });
-            cvar.notify_one();
+        } else {
+            // Already pending: bump it to the front if it's still queued.
+            // If a worker has it in flight, leave it alone — visible tiles
+            // re-request every frame, and re-queueing an in-flight path used
+            // to decode each on-screen cover 2-3x over.
+            q.promote(req);
         }
     }
 }
@@ -354,15 +438,27 @@ fn spawn_worker(
                 inner.lock().unwrap().pending.remove(&req.path);
                 continue;
             }
-            let decoded = decode_cover(&req.path, req.thumb_size);
+            let result = decode_cover(&req.path, req.thumb_size);
             {
                 let mut g = inner.lock().unwrap();
                 g.pending.remove(&req.path);
                 if *gen.lock().unwrap() == req.gen {
-                    g.decoded.insert(req.path.clone(), decoded);
+                    g.decoded.insert(
+                        req.path.clone(),
+                        Staged {
+                            thumb_size: req.thumb_size,
+                            result,
+                        },
+                    );
                 }
             }
-            ctx.request_repaint();
+            match req.priority {
+                Priority::High => ctx.request_repaint(),
+                // Off-screen prefetch: nothing visible changed, so don't force
+                // a full explorer frame per result. The deferred repaint still
+                // picks up a tile that scrolled into view mid-decode.
+                Priority::Low => ctx.request_repaint_after(Duration::from_millis(100)),
+            }
         })
         .expect("spawn thumbnail worker")
 }
@@ -398,6 +494,8 @@ fn worker_pool_size() -> usize {
 }
 
 fn decode_cover(path: &Path, thumb_size: u32) -> Option<Decoded> {
+    #[cfg(test)]
+    tests::count_decode(path);
     let bytes = cover_image(path)?;
     // DCT-scaled decode for JPEG covers (libjpeg-turbo), full zune decode for
     // everything else. Returns an image whose longest edge is already ≥
@@ -425,6 +523,171 @@ fn decode_cover(path: &Path, thumb_size: u32) -> Option<Decoded> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    /// Per-path decode counts. Keyed by path so tests running in parallel
+    /// (each in its own temp dir) don't see each other's decodes.
+    static DECODES: Mutex<Option<HashMap<PathBuf, usize>>> = Mutex::new(None);
+
+    pub(super) fn count_decode(path: &Path) {
+        let mut g = DECODES.lock().unwrap();
+        *g.get_or_insert_with(HashMap::new)
+            .entry(path.to_path_buf())
+            .or_default() += 1;
+    }
+
+    fn decodes_of(path: &Path) -> usize {
+        DECODES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(path).copied())
+            .unwrap_or(0)
+    }
+
+    fn write_covers(dir: &Path, n: usize, w: u32, h: u32) -> Vec<PathBuf> {
+        (0..n)
+            .map(|i| {
+                let img = image::RgbImage::from_fn(w, h, |x, y| {
+                    image::Rgb([(x + i as u32) as u8, y as u8, (x ^ y) as u8])
+                });
+                let p = dir.join(format!("cover{i:02}.png"));
+                img.save(&p).unwrap();
+                p
+            })
+            .collect()
+    }
+
+    /// Drive `thumbnail()` like the UI does (every visible tile, every frame)
+    /// until `done` holds for all of them.
+    fn frames_until(
+        cache: &ThumbnailCache,
+        paths: &[PathBuf],
+        size: u32,
+        mut done: impl FnMut(&ThumbStatus) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let all = paths.iter().all(|p| done(&cache.thumbnail(p, size)));
+            if all {
+                return;
+            }
+            assert!(Instant::now() < deadline, "thumbnails never became ready");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn visible_tiles_are_decoded_once() {
+        // Re-requesting an on-screen tile every frame while its decode is in
+        // flight must not queue a second decode of the same cover.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = write_covers(dir.path(), 12, 600, 900);
+        let cache = ThumbnailCache::new(Context::default(), 64);
+        frames_until(&cache, &paths, 64, |s| matches!(s, ThumbStatus::Ready(_)));
+        thread::sleep(Duration::from_millis(100)); // let any stray duplicate land
+        for p in &paths {
+            assert_eq!(decodes_of(p), 1, "{} decoded more than once", p.display());
+        }
+    }
+
+    #[test]
+    fn resize_keeps_drawing_old_texture_until_redecoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = write_covers(dir.path(), 3, 400, 600);
+        let cache = ThumbnailCache::new(Context::default(), 64);
+        frames_until(&cache, &paths, 64, |s| matches!(s, ThumbStatus::Ready(_)));
+
+        cache.cancel_queued();
+        // First frame at the new size: the 64px texture is still served.
+        for p in &paths {
+            match cache.thumbnail(p, 128) {
+                ThumbStatus::Ready(t) => assert_eq!(t.size()[1], 64),
+                _ => panic!("tile blanked on resize"),
+            }
+        }
+        // ...and is replaced once the 128px decode lands.
+        frames_until(
+            &cache,
+            &paths,
+            128,
+            |s| matches!(s, ThumbStatus::Ready(t) if t.size()[1] == 128),
+        );
+    }
+
+    #[test]
+    fn cancel_dir_drops_backlog_and_staged_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = write_covers(dir.path(), 4, 64, 64);
+        let cache = ThumbnailCache::new(Context::default(), 64);
+        for p in &paths {
+            cache.prefetch(p, 32);
+        }
+        cache.cancel_dir();
+        thread::sleep(Duration::from_millis(200));
+        let g = cache.inner.lock().unwrap();
+        assert!(
+            g.decoded.is_empty(),
+            "stale results staged after cancel_dir"
+        );
+        assert!(g.pending.is_empty(), "stale requests still pending");
+    }
+
+    #[test]
+    fn promote_does_not_requeue_in_flight_path() {
+        let mut q = Queue::new();
+        // Nothing queued for /a: a worker popped it and is decoding.
+        let promoted = q.promote(Request {
+            path: PathBuf::from("/a"),
+            thumb_size: 64,
+            gen: 0,
+            priority: Priority::High,
+        });
+        assert!(!promoted);
+        assert!(q.items.is_empty());
+    }
+
+    #[test]
+    fn promote_bumps_queued_request_and_adopts_new_size() {
+        let mut q = Queue::new();
+        for p in ["/a", "/b"] {
+            q.enqueue(Request {
+                path: PathBuf::from(p),
+                thumb_size: 64,
+                gen: 0,
+                priority: Priority::Low,
+            });
+        }
+        assert!(q.promote(Request {
+            path: PathBuf::from("/b"),
+            thumb_size: 128,
+            gen: 0,
+            priority: Priority::High,
+        }));
+        match q.pop() {
+            Some(Msg::Request(r)) => {
+                assert_eq!(r.path, PathBuf::from("/b"));
+                assert_eq!(r.thumb_size, 128);
+                assert_eq!(r.priority, Priority::High);
+            }
+            _ => panic!("expected Request"),
+        }
+    }
+
+    #[test]
+    fn drain_requests_keeps_shutdown_markers() {
+        let mut q = Queue::new();
+        q.enqueue(Request {
+            path: PathBuf::from("/a"),
+            thumb_size: 64,
+            gen: 0,
+            priority: Priority::Low,
+        });
+        q.push_shutdown();
+        assert_eq!(q.drain_requests(), vec![PathBuf::from("/a")]);
+        assert!(matches!(q.pop(), Some(Msg::Shutdown)));
+        assert!(q.pop().is_none());
+    }
 
     #[test]
     fn priority_push_order_is_front_for_high() {

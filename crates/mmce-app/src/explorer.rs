@@ -71,6 +71,9 @@ impl ExplorerState {
     }
 
     pub fn cd(&mut self, path: PathBuf) {
+        if path != self.current {
+            self.cache.cancel_dir();
+        }
         self.current = path;
         self.selection = 0;
         self.refresh();
@@ -106,7 +109,8 @@ impl ExplorerState {
             .map(|e| e.path.clone())
     }
 
-    /// Keep thumbnails and tiles proportional. Re-decode on change.
+    /// Keep thumbnails and tiles proportional. Re-decode on change; existing
+    /// textures keep being drawn (scaled) until the new size lands.
     pub fn set_tile_width(&mut self, w: f32) {
         let clamped = w.clamp(TILE_W_MIN, TILE_W_MAX);
         if (clamped - self.tile_w).abs() < 0.5 {
@@ -117,7 +121,7 @@ impl ExplorerState {
         // LRU reuse when the user flips back and forth.
         let target = (clamped * 0.89) as u32;
         self.thumb_size = (target / 8) * 8;
-        self.cache.clear();
+        self.cache.cancel_queued();
     }
 
     pub fn thumb_bigger(&mut self) {
@@ -371,7 +375,10 @@ pub fn draw(ui: &mut Ui, state: &mut ExplorerState) -> Option<Entry> {
                         if hit {
                             clicked = Some(entry.clone());
                         }
-                        visible_rects.push((entry.path.clone(), rect));
+                        // The parent tile is a glyph, not a cover.
+                        if entry.kind != EntryKind::ParentDir {
+                            visible_rects.push((entry.path.clone(), rect));
+                        }
                     }
                 });
             }
@@ -379,28 +386,52 @@ pub fn draw(ui: &mut Ui, state: &mut ExplorerState) -> Option<Entry> {
         })
         .inner;
 
-    // Prefetch every off-screen tile in the current filtered view at low
-    // priority. Visible tiles were already queued at HIGH priority inside
-    // `draw_tile` via `thumbnail()`; we only top-up the ones further down
-    // the scroll. Dedup in the worker pool means re-calling this each
-    // frame is idempotent.
-    prefetch_all(&state.cache, &visible_rects, clip, thumb_size);
+    // Prefetch off-screen tiles in the current filtered view at low
+    // priority, nearest the viewport first. Visible tiles were already
+    // queued at HIGH priority inside `draw_tile` via `thumbnail()`. Dedup in
+    // the worker pool means re-calling this each frame is idempotent.
+    prefetch_nearby(&state.cache, &visible_rects, clip, thumb_size);
 
     clicked
 }
 
-fn prefetch_all(
+/// Upper bound on decoded-but-not-yet-shown thumbnail pixels the prefetcher
+/// may ask for. Whole-directory prefetch of a huge folder at the largest tile
+/// size would otherwise stage gigabytes of RGBA.
+const PREFETCH_BUDGET_BYTES: usize = 128 << 20;
+
+fn prefetch_nearby(
     cache: &ThumbnailCache,
     rects: &[(PathBuf, egui::Rect)],
     clip: egui::Rect,
     thumb_size: u32,
 ) {
-    for (path, rect) in rects {
-        // Already on screen → `thumbnail()` took the HIGH-priority path.
-        if clip.intersects(*rect) {
-            continue;
+    // Square RGBA is the worst case per tile; portrait covers use less.
+    let per_tile = (thumb_size as usize).pow(2).max(1) * 4;
+    let budget = (PREFETCH_BUDGET_BYTES / per_tile).max(64);
+
+    // Visible tiles took the HIGH-priority path in `thumbnail()`. Fan out
+    // from them, two rows' worth below for every one above: the low queue is
+    // FIFO, so this order is the order covers arrive in, and users mostly
+    // scroll forward.
+    let on_screen = |r: &egui::Rect| clip.intersects(*r);
+    let first = rects.iter().position(|(_, r)| on_screen(r)).unwrap_or(0);
+    let last = rects
+        .iter()
+        .rposition(|(_, r)| on_screen(r))
+        .map_or(first, |i| i + 1);
+    let mut below = rects[last..].iter();
+    let mut above = rects[..first].iter().rev();
+    let mut n = 0;
+    while n < budget {
+        let batch = [below.next(), below.next(), above.next()];
+        if batch.iter().all(Option::is_none) {
+            break;
         }
-        cache.prefetch(path, thumb_size);
+        for (path, _) in batch.into_iter().flatten() {
+            cache.prefetch(path, thumb_size);
+            n += 1;
+        }
     }
 }
 

@@ -28,11 +28,14 @@ serde = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = [
     "jpeg", "png", "gif", "bmp", "webp", "tiff",
 ] }
-zip = { version = "2", default-features = false, features = ["deflate", "bzip2"] }
-# Pull flate2 to the workspace with the zlib-rs backend. zip (via the
-# `deflate` feature) and png both depend on flate2 transitively with the
-# default miniz_oxide backend — this override picks the pure-Rust
-# SIMD-accelerated zlib-rs port instead (PCLMUL CRC32, SSE4.2 inflate).
+# zip >= 3 stopped seeking to every entry's local header inside
+# `ZipArchive::new` (2.x did N random reads per open — one per page — which
+# dominated cold explorer scans). 4.x is the newest line within our MSRV.
+zip = { version = "4", default-features = false, features = ["deflate-flate2-zlib-rs", "bzip2"] }
+# Pull flate2 to the workspace with the zlib-rs backend. zip names the
+# zlib-rs backend itself (`deflate-flate2-zlib-rs`); this override keeps any
+# other transitive flate2 user off the default miniz_oxide backend — the
+# pure-Rust SIMD-accelerated zlib-rs port instead (PCLMUL CRC32, SSE4.2 inflate).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 sevenz-rust2 = "0.17"
 tar = "0.4"
