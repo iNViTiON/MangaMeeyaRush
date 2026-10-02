@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -75,11 +76,6 @@ impl Queue {
             Msg::Request(r) => r.path == path,
             Msg::Shutdown => false,
         })
-    }
-
-    fn enqueue(&mut self, req: Request) {
-        let pos = self.position(&req.path);
-        self.merge_or_push(pos, req);
     }
 
     /// `pos` is where a request for the same path already sits, if any: merge
@@ -213,8 +209,43 @@ impl TexStore {
     }
 }
 
+/// Relaxed atomic counters behind [`ThumbnailCache::take_stats`].
+#[derive(Default)]
+struct Counters {
+    decodes: AtomicU64,
+    discarded: AtomicU64,
+    uploads: AtomicU64,
+    calls: AtomicU64,
+    calls_pending: AtomicU64,
+}
+
+/// Diagnostics snapshot for benchmarks and debugging (see
+/// `examples/library_sim.rs`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ThumbStats {
+    pub workers: usize,
+    /// Covers decoded by workers, failures included.
+    pub decodes: u64,
+    /// Decoded results dropped because `cancel_dir()` ran mid-decode.
+    pub discarded: u64,
+    /// Textures uploaded.
+    pub uploads: u64,
+    pub textures: usize,
+    /// Decoded, not yet uploaded (off-screen prefetch results).
+    pub staged: usize,
+    pub staged_bytes: usize,
+    /// Queued + in flight.
+    pub pending: usize,
+    pub queued: usize,
+    /// `thumbnail()` calls since the previous `take_stats()`, and how many
+    /// of them returned `Pending`. One frame's worth = visible tiles.
+    pub calls: u64,
+    pub calls_pending: u64,
+}
+
 pub struct ThumbnailCache {
     ctx: Context,
+    counters: Arc<Counters>,
     inner: Arc<Mutex<Inner>>,
     queue: Arc<(Mutex<Queue>, Condvar)>,
     tex: Mutex<TexStore>,
@@ -233,14 +264,25 @@ impl ThumbnailCache {
         }));
         let queue = Arc::new((Mutex::new(Queue::new()), Condvar::new()));
         let gen = Arc::new(Mutex::new(0u64));
+        let counters = Arc::new(Counters::default());
         // Worker-pool size: ~1.5x cores by default, env-overridable. See
         // worker_pool_size() for the rationale and the MMCE_THUMB_WORKERS knob.
         let n = worker_pool_size();
         let workers = (0..n)
-            .map(|i| spawn_worker(i, queue.clone(), inner.clone(), ctx.clone(), gen.clone()))
+            .map(|i| {
+                spawn_worker(
+                    i,
+                    queue.clone(),
+                    inner.clone(),
+                    ctx.clone(),
+                    gen.clone(),
+                    counters.clone(),
+                )
+            })
             .collect();
         Self {
             ctx,
+            counters,
             inner,
             queue,
             tex: Mutex::new(TexStore {
@@ -254,6 +296,39 @@ impl ThumbnailCache {
             worker_count: n,
             _workers: workers,
             gen,
+        }
+    }
+
+    /// Diagnostics snapshot. Resets the per-call counters (`calls`,
+    /// `calls_pending`), so calling it once per frame yields per-frame
+    /// visible-tile counts.
+    pub fn take_stats(&self) -> ThumbStats {
+        let c = &self.counters;
+        let (staged, staged_bytes, pending) = {
+            let g = self.inner.lock().unwrap();
+            let bytes = g
+                .decoded
+                .values()
+                .filter_map(|s| s.result.as_ref().map(|d| d.pixels.len()))
+                .sum();
+            (g.decoded.len(), bytes, g.pending.len())
+        };
+        let queued = {
+            let (lock, _) = &*self.queue;
+            lock.lock().unwrap().items.len()
+        };
+        ThumbStats {
+            workers: self.worker_count,
+            decodes: c.decodes.load(Ordering::Relaxed),
+            discarded: c.discarded.load(Ordering::Relaxed),
+            uploads: c.uploads.load(Ordering::Relaxed),
+            textures: self.tex.lock().unwrap().map.len(),
+            staged,
+            staged_bytes,
+            pending,
+            queued,
+            calls: c.calls.swap(0, Ordering::Relaxed),
+            calls_pending: c.calls_pending.swap(0, Ordering::Relaxed),
         }
     }
 
@@ -290,6 +365,7 @@ impl ThumbnailCache {
     /// and returns `Pending`. `Failed` means the path couldn't decode — the
     /// UI should fall back to an icon.
     pub fn thumbnail(&self, path: &Path, thumb_size: u32) -> ThumbStatus {
+        self.counters.calls.fetch_add(1, Ordering::Relaxed);
         if let Some(status) = self.tex_status(path, thumb_size, true) {
             return status;
         }
@@ -301,6 +377,7 @@ impl ThumbnailCache {
                 // opaque (JPEG has no alpha; PNG covers are overwhelmingly
                 // opaque) so the result is identical.
                 let ci = ColorImage::from_rgba_premultiplied(d.size, &d.pixels);
+                self.counters.uploads.fetch_add(1, Ordering::Relaxed);
                 self.ctx.load_texture(
                     format!("mmce_thumb_{}", path.display()),
                     ci,
@@ -319,8 +396,10 @@ impl ThumbnailCache {
         self.enqueue(path, thumb_size, Priority::High);
         // A texture at another size (tile size just changed) beats a
         // placeholder: draw it scaled until the re-decode lands.
-        self.tex_status(path, thumb_size, false)
-            .unwrap_or(ThumbStatus::Pending)
+        self.tex_status(path, thumb_size, false).unwrap_or_else(|| {
+            self.counters.calls_pending.fetch_add(1, Ordering::Relaxed);
+            ThumbStatus::Pending
+        })
     }
 
     /// Status from the texture store. With `exact`, only a texture that
@@ -376,7 +455,11 @@ impl ThumbnailCache {
         let (lock, cvar) = &*self.queue;
         let mut q = lock.lock().unwrap();
         if newly_queued {
-            q.enqueue(req);
+            // Not pending ⇒ not queued (the queue is a subset of `pending`),
+            // so skip `enqueue`'s duplicate scan: entering a big folder
+            // queues every tile in one frame, and scanning made that O(n²)
+            // — ~100 ms of UI stall for 1000 entries.
+            q.push(req);
             cvar.notify_one();
         } else {
             // Already pending: bump it to the front if it's still queued.
@@ -411,6 +494,7 @@ fn spawn_worker(
     inner: Arc<Mutex<Inner>>,
     ctx: Context,
     gen: Arc<Mutex<u64>>,
+    counters: Arc<Counters>,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name(format!("mmce-thumbs-{id}"))
@@ -439,10 +523,13 @@ fn spawn_worker(
                 continue;
             }
             let result = decode_cover(&req.path, req.thumb_size);
+            counters.decodes.fetch_add(1, Ordering::Relaxed);
             {
                 let mut g = inner.lock().unwrap();
                 g.pending.remove(&req.path);
-                if *gen.lock().unwrap() == req.gen {
+                if *gen.lock().unwrap() != req.gen {
+                    counters.discarded.fetch_add(1, Ordering::Relaxed);
+                } else {
                     g.decoded.insert(
                         req.path.clone(),
                         Staged {
@@ -651,7 +738,7 @@ mod tests {
     fn promote_bumps_queued_request_and_adopts_new_size() {
         let mut q = Queue::new();
         for p in ["/a", "/b"] {
-            q.enqueue(Request {
+            q.push(Request {
                 path: PathBuf::from(p),
                 thumb_size: 64,
                 gen: 0,
@@ -677,7 +764,7 @@ mod tests {
     #[test]
     fn drain_requests_keeps_shutdown_markers() {
         let mut q = Queue::new();
-        q.enqueue(Request {
+        q.push(Request {
             path: PathBuf::from("/a"),
             thumb_size: 64,
             gen: 0,
@@ -692,13 +779,13 @@ mod tests {
     #[test]
     fn priority_push_order_is_front_for_high() {
         let mut q = Queue::new();
-        q.enqueue(Request {
+        q.push(Request {
             path: PathBuf::from("/a"),
             thumb_size: 64,
             gen: 0,
             priority: Priority::Low,
         });
-        q.enqueue(Request {
+        q.push(Request {
             path: PathBuf::from("/b"),
             thumb_size: 64,
             gen: 0,
@@ -717,18 +804,18 @@ mod tests {
     #[test]
     fn duplicate_request_upgrades_priority() {
         let mut q = Queue::new();
-        q.enqueue(Request {
+        q.push(Request {
             path: PathBuf::from("/a"),
             thumb_size: 64,
             gen: 0,
             priority: Priority::Low,
         });
-        q.enqueue(Request {
+        assert!(q.promote(Request {
             path: PathBuf::from("/a"),
             thumb_size: 64,
             gen: 0,
             priority: Priority::High,
-        });
+        }));
         assert_eq!(q.items.len(), 1);
         match q.pop() {
             Some(Msg::Request(r)) => {

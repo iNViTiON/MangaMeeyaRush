@@ -15,14 +15,18 @@ use mmce_render::{compute_size, PageCache};
 mod anim;
 mod bookmarks;
 mod dialogs;
-mod explorer;
+// Public (hidden) so `examples/library_sim.rs` can drive the real explorer
+// and thumbnail pipeline headlessly.
+#[doc(hidden)]
+pub mod explorer;
 mod file_ops;
 mod history;
 mod input;
 mod overlay;
 mod playback;
 mod settings;
-mod thumbs;
+#[doc(hidden)]
+pub mod thumbs;
 
 pub(crate) use settings::SettingsDialog;
 
