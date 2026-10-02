@@ -1,4 +1,4 @@
-# mmce — MangaMeeya, reborn in Rust
+# MangaMeeyaRush — MangaMeeyaCE, reborn in Rust
 
 A cross-platform manga / image viewer modelled on the old Japanese freeware
 **MangaMeeya CE** (2005–2007). That binary is Win32-only and has no source
