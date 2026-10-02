@@ -42,6 +42,18 @@ Legacy-INI fixture quickly (no fixture regeneration):
 scripts/smoke.sh
 ```
 
+Library-scale benchmarks (headless — real explorer / thumbnail / PageCache code, no window or GPU):
+
+```sh
+# Synthetic manga library (~15 GB real + sparse bulk; --scale 0.05 for a quick one)
+cargo run --release -p mmce-codecs --example gen_corpus -- /tmp/corpus
+# Scenarios: scan | scroll | folders | read | hop — prints a RESULT line per run
+cargo run --release -p mmce-app --example library_sim -- scan /tmp/corpus/Library/Main
+sync; echo 3 | sudo tee /proc/sys/vm/drop_caches   # before a cold run
+```
+
+`library_sim` works on a real library too. `ThumbnailCache::take_stats()` / `PageCache::stats()` expose the counters it reports (decodes, duplicates, staged bytes, queue depth, texture counts).
+
 ## Workspace architecture
 
 **Trust boundary**: `mmce-core` and everything below it have no `egui` dep — they can be unit-tested without a GPU context. `mmce-render` is the first crate that sees egui, and `mmce-app` is the only one that sees `eframe`.
@@ -83,7 +95,8 @@ Don't reintroduce these by reverting them:
 - Thumbnail resize uses `DynamicImage::thumbnail_exact` (fast box filter), not `resize_exact(Triangle)`.
 - **Thumbnail cover decode is DCT-scaled for JPEG.** `mmce_codecs::decode_cover_image(bytes, target)` decodes JPEG covers through `mozjpeg` (libjpeg-turbo) at the smallest `1/8…1/1` step whose longest edge stays ≥ `target` (`scale(n)` where `n = ceil(8·target / max(w,h))`). Measured ~1.5–2× faster than the full zune decode on real covers, and it also collapses the box-shrink (you downscale a ~150px image, not a ~1500px one). It is **JPEG-only** and falls back to the full zune `decode_image` for non-JPEG, CMYK/YCCK, or any decode error — worst case is "slower", never "wrong". The SOI magic-byte guard in `decode_jpeg_scaled` is load-bearing: handed non-JPEG bytes libjpeg can *abort the process*, so never feed it anything that isn't a JPEG. Don't revert this to a plain `decode_image` in `thumbs.rs::decode_cover`.
 - **CBZ open touches only the central directory.** `zip` is pinned at ≥ 3 (4.x, our MSRV) because 2.x's `ZipArchive::new` seeked to every entry's local header — one random read per page — which dominated cold explorer scans. `ZipSource::open` enumerates via `name_for_index` (never `by_index`, which also reads the local header and builds an inflater per entry), and archives sit on a `SeekBufReader` whose buffer survives zip's per-entry `seek(Start(stream_position()))` (std `BufReader` discards it). Net: ~1,200 → ~25 syscalls per cover and cold cover I/O ~8 ms → ~1.5 ms on a 150-page CBZ.
-- **Thumbnail requests for in-flight paths are never re-queued.** Visible tiles call `thumbnail()` every frame; `ThumbnailCache::enqueue` only `promote`s a request that is still queued. Re-queueing an in-flight path used to decode each on-screen cover 2–3× (pinned by `visible_tiles_are_decoded_once`). Ctrl± doesn't wipe the cache either: textures remember their decode size and are drawn scaled until the new size lands. `cd()` calls `cancel_dir()` to drop the old folder's backlog and staged results; prefetch fans out nearest-first and is capped by `PREFETCH_BUDGET_BYTES`.
+- **Thumbnail requests for in-flight paths are never re-queued.** Visible tiles call `thumbnail()` every frame; `ThumbnailCache::enqueue` only `promote`s a request that is still queued. Re-queueing an in-flight path used to decode each on-screen cover 2–3× (pinned by `visible_tiles_are_decoded_once`). Ctrl± doesn't wipe the cache either: textures remember their decode size and are drawn scaled until the new size lands. `cd()` calls `cancel_dir()` to drop the old folder's backlog and staged results; prefetch fans out nearest-first and is capped by `PREFETCH_BUDGET_BYTES`. A request for a path that isn't pending is `push`ed without the queue's duplicate scan (the queue is a subset of `pending`) — scanning made entering a 1000-entry folder O(n²), an ~100 ms UI stall.
+- **PageCache never decodes a page twice concurrently.** `texture()` and `prefetch_directed` run every frame; `Queue::pending` holds indices queued or in flight, so repeats are dropped (a high-priority repeat promotes a queued low one), and workers call `done(index)` only after `put`. Without it 17–50% of page decodes were duplicates while flipping fast (pinned by `pages_are_decoded_once_under_per_frame_requests`). Results whose epoch went stale mid-decode are dropped, so a page decoded with the old filter pipeline can't land in the cleared cache.
 - Forward-biased prefetch: app passes a `hint_direction` derived from cursor delta into `prefetch_directed(&window, 4, 1, hint)`.
 - **Thumbnail decode pool is oversubscribed ~1.5× cores.** Cold explorer scans are I/O-wait-bound — a worker blocks on a cold archive read and idles its core — so `worker_pool_size()` in `mmce-app/src/thumbs.rs` defaults to `(cores*3/2).clamp(4,16)` instead of `cores-1`. Measured ~+12% cold-scan throughput already at cores+1 and rising toward a ~+75% ceiling near ~1.66× cores (the cold floor ≈ the warm time), while warm throughput stays flat out to 4× cores (no regression — the oversubscription is free when reads hit the page cache). Override with `MMCE_THUMB_WORKERS` (usize, ignored if unset/invalid/zero, clamp [1,64]); push it higher on slow / FUSE storage where reads block longer. Don't revert the default to `cores-1`.
 
