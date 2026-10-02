@@ -5,7 +5,7 @@
 //! use a high-priority lane, prefetch uses low-priority. egui textures are
 //! created lazily on the UI thread the first time a page is painted.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -132,25 +132,42 @@ enum WorkerMsg {
 /// observed promptly by idle workers.
 struct Queue {
     items: VecDeque<WorkerMsg>,
+    /// Page indices queued or being decoded. `texture()` and
+    /// `prefetch_directed` run every frame; without this a page still being
+    /// decoded was queued again each frame and several workers decoded it
+    /// at once (17-50% of all decodes while flipping quickly).
+    pending: HashSet<usize>,
 }
 
 impl Queue {
     fn new() -> Self {
         Self {
             items: VecDeque::new(),
+            pending: HashSet::new(),
         }
     }
 
     fn push(&mut self, msg: WorkerMsg) {
         match msg {
             WorkerMsg::Decode {
-                priority: Priority::High,
-                ..
-            } => self.items.push_front(msg),
-            WorkerMsg::Decode {
-                priority: Priority::Low,
-                ..
-            } => self.items.push_back(msg),
+                index,
+                priority,
+                epoch,
+            } => {
+                if !self.pending.insert(index) {
+                    // Already queued or in flight. A high-priority request
+                    // for a page still waiting in the low lane jumps the
+                    // queue; an in-flight page is left alone.
+                    if priority == Priority::High {
+                        self.promote(index, epoch);
+                    }
+                    return;
+                }
+                match priority {
+                    Priority::High => self.items.push_front(msg),
+                    Priority::Low => self.items.push_back(msg),
+                }
+            }
             // Control messages always go to the front.
             WorkerMsg::SwapSource(_) | WorkerMsg::SwapPipeline(_) | WorkerMsg::Shutdown => {
                 self.items.push_front(msg)
@@ -158,16 +175,42 @@ impl Queue {
         }
     }
 
+    fn promote(&mut self, index: usize, epoch: u64) {
+        let queued_low = self.items.iter().position(|m| {
+            matches!(m, WorkerMsg::Decode { index: i, priority: Priority::Low, .. } if *i == index)
+        });
+        if let Some(pos) = queued_low {
+            self.items.remove(pos);
+            self.items.push_front(WorkerMsg::Decode {
+                index,
+                priority: Priority::High,
+                epoch,
+            });
+        }
+    }
+
     fn pop(&mut self) -> Option<WorkerMsg> {
         self.items.pop_front()
+    }
+
+    /// A worker is finished with `index` (decoded, failed or skipped).
+    fn done(&mut self, index: usize) {
+        self.pending.remove(&index);
     }
 
     /// Drop every pending decode whose epoch is older than `current`. Used
     /// when the user jumps far from the previous window — stale prefetch
     /// wastes CPU on pages that are no longer relevant.
     fn cancel_stale(&mut self, current: u64) {
+        let pending = &mut self.pending;
         self.items.retain(|m| match m {
-            WorkerMsg::Decode { epoch, .. } => *epoch >= current,
+            WorkerMsg::Decode { epoch, index, .. } => {
+                let keep = *epoch >= current;
+                if !keep {
+                    pending.remove(index);
+                }
+                keep
+            }
             _ => true,
         });
     }
@@ -208,7 +251,38 @@ impl CacheInner {
     }
 }
 
+/// Relaxed atomic counters behind [`PageCache::stats`].
+#[derive(Default)]
+struct Counters {
+    decodes: AtomicU64,
+    duplicates: AtomicU64,
+    stale_skipped: AtomicU64,
+    already_skipped: AtomicU64,
+    failed: AtomicU64,
+}
+
+/// Diagnostics snapshot for benchmarks and debugging.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PageStats {
+    pub workers: usize,
+    /// Pages decoded (successfully) by workers.
+    pub decodes: u64,
+    /// Decodes of a page that was already cached by the time they finished:
+    /// the same page decoded twice concurrently.
+    pub duplicate_decodes: u64,
+    /// Requests skipped because a big jump / swap bumped the epoch.
+    pub stale_skipped: u64,
+    /// Requests skipped because the page was already cached when popped.
+    pub already_skipped: u64,
+    pub failed: u64,
+    pub queued: usize,
+    pub cached: usize,
+    pub cached_bytes: usize,
+    pub textures: usize,
+}
+
 pub struct PageCache {
+    counters: Arc<Counters>,
     inner: Arc<Mutex<CacheInner>>,
     tex: Mutex<TexLru>,
     queue: Arc<(Mutex<Queue>, Condvar)>,
@@ -237,6 +311,7 @@ impl PageCache {
         let pipeline = Arc::new(Pipeline::new());
         let queue = Arc::new((Mutex::new(Queue::new()), Condvar::new()));
         let epoch = Arc::new(AtomicU64::new(0));
+        let counters = Arc::new(Counters::default());
         // CPU-scaled decoder pool. One core reserved for UI; floor 2 so
         // even a 2-core machine still pipelines read + decode; ceiling 8
         // because past that you saturate NVMe queue depth and libjpeg
@@ -256,10 +331,12 @@ impl PageCache {
                     pipeline.clone(),
                     ctx.clone(),
                     epoch.clone(),
+                    counters.clone(),
                 )
             })
             .collect();
         Self {
+            counters,
             inner,
             tex: Mutex::new(TexLru::new(capacity)),
             queue,
@@ -291,6 +368,27 @@ impl PageCache {
         q.push(WorkerMsg::SwapPipeline(arc));
         cvar.notify_all();
         self.egui_ctx.request_repaint();
+    }
+
+    /// Diagnostics snapshot.
+    pub fn stats(&self) -> PageStats {
+        let c = &self.counters;
+        let (cached, cached_bytes) = {
+            let g = self.inner.lock().unwrap();
+            (g.map.len(), g.map.values().map(|p| p.pixels.len()).sum())
+        };
+        PageStats {
+            workers: self.worker_count,
+            decodes: c.decodes.load(Ordering::Relaxed),
+            duplicate_decodes: c.duplicates.load(Ordering::Relaxed),
+            stale_skipped: c.stale_skipped.load(Ordering::Relaxed),
+            already_skipped: c.already_skipped.load(Ordering::Relaxed),
+            failed: c.failed.load(Ordering::Relaxed),
+            queued: self.queue.0.lock().unwrap().items.len(),
+            cached,
+            cached_bytes,
+            textures: self.tex.lock().unwrap().map.len(),
+        }
     }
 
     /// Intrinsic size of a decoded page, if it's currently in the cache.
@@ -484,6 +582,7 @@ fn spawn_worker(
     initial_pipeline: Arc<Pipeline>,
     ctx: Context,
     epoch: Arc<AtomicU64>,
+    counters: Arc<Counters>,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name(format!("mmce-decoder-{id}"))
@@ -513,33 +612,54 @@ fn spawn_worker(
                         epoch: req_epoch,
                         ..
                     } => {
-                        // Skip stale requests (user jumped far away between
-                        // enqueue and now).
-                        if req_epoch < epoch.load(Ordering::Relaxed) {
-                            continue;
-                        }
-                        let already = cache.lock().unwrap().map.contains_key(&index);
-                        if already {
-                            continue;
-                        }
-                        if index >= source.len() {
-                            continue;
-                        }
-                        match source.read(index).and_then(|b| decode_image(&b)) {
-                            Ok(img) => {
-                                let filtered = if pipeline.is_identity() {
-                                    img
-                                } else {
-                                    pipeline.apply(img)
-                                };
-                                let page = DecodedPage::from_dynamic(filtered);
-                                cache.lock().unwrap().put(index, page);
-                                ctx.request_repaint();
+                        'work: {
+                            // Skip stale requests (user jumped far away between
+                            // enqueue and now).
+                            if req_epoch < epoch.load(Ordering::Relaxed) {
+                                counters.stale_skipped.fetch_add(1, Ordering::Relaxed);
+                                break 'work;
                             }
-                            Err(e) => {
-                                log::warn!("decode page {index} failed: {e}");
+                            let already = cache.lock().unwrap().map.contains_key(&index);
+                            if already {
+                                counters.already_skipped.fetch_add(1, Ordering::Relaxed);
+                                break 'work;
+                            }
+                            if index >= source.len() {
+                                break 'work;
+                            }
+                            match source.read(index).and_then(|b| decode_image(&b)) {
+                                Ok(img) => {
+                                    let filtered = if pipeline.is_identity() {
+                                        img
+                                    } else {
+                                        pipeline.apply(img)
+                                    };
+                                    let page = DecodedPage::from_dynamic(filtered);
+                                    counters.decodes.fetch_add(1, Ordering::Relaxed);
+                                    // A pipeline / source swap mid-decode makes
+                                    // this page wrong for the cleared cache.
+                                    if req_epoch < epoch.load(Ordering::Relaxed) {
+                                        counters.stale_skipped.fetch_add(1, Ordering::Relaxed);
+                                        break 'work;
+                                    }
+                                    {
+                                        let mut g = cache.lock().unwrap();
+                                        if g.map.contains_key(&index) {
+                                            counters.duplicates.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        g.put(index, page);
+                                    }
+                                    ctx.request_repaint();
+                                }
+                                Err(e) => {
+                                    counters.failed.fetch_add(1, Ordering::Relaxed);
+                                    log::warn!("decode page {index} failed: {e}");
+                                }
                             }
                         }
+                        // After the put: a request arriving in between sees
+                        // the page cached instead of re-queueing it.
+                        queue.0.lock().unwrap().done(index);
                     }
                 }
             }
@@ -627,6 +747,118 @@ mod tests {
         // Only the control message should survive.
         assert_eq!(q.items.len(), 1);
         assert!(matches!(q.pop(), Some(WorkerMsg::Shutdown)));
+    }
+
+    fn decode(index: usize, priority: Priority) -> WorkerMsg {
+        WorkerMsg::Decode {
+            index,
+            priority,
+            epoch: 0,
+        }
+    }
+
+    #[test]
+    fn push_drops_requests_for_pending_pages() {
+        let mut q = Queue::new();
+        q.push(decode(3, Priority::Low));
+        q.push(decode(3, Priority::Low));
+        assert_eq!(q.items.len(), 1);
+        // In flight (popped, not yet done): still deduplicated.
+        assert!(q.pop().is_some());
+        q.push(decode(3, Priority::High));
+        assert!(q.items.is_empty());
+        q.done(3);
+        q.push(decode(3, Priority::High));
+        assert_eq!(q.items.len(), 1);
+    }
+
+    #[test]
+    fn high_request_promotes_queued_low_page() {
+        let mut q = Queue::new();
+        q.push(decode(1, Priority::Low));
+        q.push(decode(2, Priority::Low));
+        q.push(decode(2, Priority::High));
+        assert_eq!(q.items.len(), 2);
+        match q.pop() {
+            Some(WorkerMsg::Decode {
+                index: 2,
+                priority: Priority::High,
+                ..
+            }) => {}
+            _ => panic!("expected page 2 promoted to the front"),
+        }
+    }
+
+    #[test]
+    fn cancel_stale_clears_pending() {
+        let mut q = Queue::new();
+        q.push(decode(1, Priority::Low));
+        q.cancel_stale(1);
+        q.push(decode(1, Priority::Low));
+        assert_eq!(q.items.len(), 1, "cancelled page must be requestable again");
+    }
+
+    /// PNG pages behind a deliberately slow `read`, counting reads per page.
+    struct SlowSource {
+        page: Vec<u8>,
+        reads: Mutex<HashMap<usize, usize>>,
+    }
+
+    impl PageSource for SlowSource {
+        fn len(&self) -> usize {
+            12
+        }
+        fn name(&self) -> &str {
+            "slow"
+        }
+        fn entry_name(&self, _idx: usize) -> Option<&str> {
+            Some("p.png")
+        }
+        fn read(&self, idx: usize) -> Result<Vec<u8>, mmce_codecs::CodecError> {
+            *self.reads.lock().unwrap().entry(idx).or_default() += 1;
+            thread::sleep(std::time::Duration::from_millis(30));
+            Ok(self.page.clone())
+        }
+    }
+
+    #[test]
+    fn pages_are_decoded_once_under_per_frame_requests() {
+        // The app calls texture() for the spread and prefetch_directed every
+        // frame; pages still decoding must not be decoded again.
+        let mut page = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(64, 96))
+            .write_to(
+                &mut std::io::Cursor::new(&mut page),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let src = Arc::new(SlowSource {
+            page,
+            reads: Mutex::new(HashMap::new()),
+        });
+        let cache = PageCache::new(Context::default(), src.clone(), 16);
+        let window = [0, 1];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let shown = window.iter().all(|&i| cache.texture(i).is_some());
+            cache.prefetch_directed(&window, 4, 1, 1);
+            if shown && (0..=5).all(|i| cache.page_dimensions(i).is_some()) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "pages never decoded");
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        thread::sleep(std::time::Duration::from_millis(100));
+        let reads = src.reads.lock().unwrap();
+        for i in 0..=5 {
+            assert_eq!(
+                reads.get(&i),
+                Some(&1),
+                "page {i} read {:?} times",
+                reads.get(&i)
+            );
+        }
+        assert_eq!(cache.stats().duplicate_decodes, 0);
     }
 
     #[test]
