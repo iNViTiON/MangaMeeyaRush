@@ -4,11 +4,16 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use egui::{Align, Color32, Context, Layout, ScrollArea, Sense, TextStyle, Ui, Vec2};
-use mmce_codecs::{is_archive_path, is_image_path};
+use mmce_codecs::{is_archive_path, is_image_path, open_source, PageSource};
 
-use crate::thumbs::{ThumbStatus, ThumbnailCache};
+use crate::thumbs::{PageRef, ThumbStatus, ThumbnailCache};
+
+/// Type-to-jump: keystrokes closer together than this extend one search.
+const TYPEAHEAD_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Minimum / maximum tile footprint (width). Drives thumb size and label
 /// area together so aspect stays readable.
@@ -20,6 +25,9 @@ pub struct Entry {
     pub path: PathBuf,
     pub label: String,
     pub kind: EntryKind,
+    /// Page index when this tile is a page of the archive being browsed
+    /// (`EntryKind::Page`); `path` is then a unique key, not a real file.
+    pub page: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +36,8 @@ pub enum EntryKind {
     Folder,
     Archive,
     Image,
+    /// A page inside the archive the explorer is showing as thumbnails.
+    Page,
 }
 
 /// The explorer's browsing state — which directory we're showing.
@@ -48,6 +58,16 @@ pub struct ExplorerState {
     pub thumb_size: u32,
     /// Last-observed columns — used for up/down keyboard navigation.
     pub columns: usize,
+    /// Set while showing an archive's pages as thumbnails instead of a
+    /// directory listing; `current` is then the archive file itself.
+    pages: Option<Arc<dyn PageSource>>,
+    /// What the scroll area was last centred on. The selected tile is only
+    /// scrolled into view when this changes, so wheel / trackpad scrolling
+    /// isn't fought by a per-frame "keep the selection centred".
+    scrolled_to: Option<(PathBuf, String, usize, u32)>,
+    /// Type-to-jump buffer and when it was last extended.
+    typed: String,
+    typed_at: Option<Instant>,
 }
 
 impl ExplorerState {
@@ -65,22 +85,57 @@ impl ExplorerState {
             tile_w: 104.0,
             thumb_size: 88,
             columns: 1,
+            pages: None,
+            scrolled_to: None,
+            typed: String::new(),
+            typed_at: None,
         };
         s.refresh();
         s
     }
 
     pub fn cd(&mut self, path: PathBuf) {
-        if path != self.current {
+        if path != self.current || self.pages.is_some() {
             self.cache.cancel_dir();
         }
+        self.pages = None;
         self.current = path;
         self.selection = 0;
         self.refresh();
     }
 
+    /// Show `archive`'s pages as thumbnails (the archive-file counterpart of
+    /// browsing a folder of images) with page `page` selected. Returns false,
+    /// leaving the view untouched, if the archive can't be opened.
+    pub fn show_pages(&mut self, archive: &Path, page: usize) -> bool {
+        let reuse = self.pages.is_some() && self.current == archive;
+        if !reuse {
+            let Ok(src) = open_source(archive) else {
+                return false;
+            };
+            self.cache.cancel_dir();
+            self.pages = Some(Arc::from(src));
+            self.current = archive.to_path_buf();
+            self.refresh();
+        }
+        self.selection = self
+            .entries
+            .iter()
+            .position(|e| e.page == Some(page))
+            .unwrap_or(0);
+        true
+    }
+
+    /// The archive whose pages are on screen, if any.
+    pub fn browsing_archive(&self) -> Option<&Path> {
+        self.pages.as_ref().map(|_| self.current.as_path())
+    }
+
     pub fn refresh(&mut self) {
-        self.entries = list_dir(&self.current);
+        self.entries = match &self.pages {
+            Some(src) => list_pages(&self.current, src.as_ref()),
+            None => list_dir(&self.current),
+        };
         if self.selection >= self.entries.len() {
             self.selection = self.entries.len().saturating_sub(1);
         }
@@ -104,9 +159,78 @@ impl ExplorerState {
 
     /// Selected path in the filtered view, if any.
     pub fn selected_path(&self) -> Option<PathBuf> {
+        // Page tiles aren't files: rename / delete must never see them.
         self.visible_entries()
             .get(self.selection)
+            .filter(|e| e.page.is_none())
             .map(|e| e.path.clone())
+    }
+
+    /// True while a type-to-jump search is in progress (its buffer hasn't
+    /// timed out). Keys that normally act on their own (like `E`) are typed
+    /// instead, so words containing them can be completed.
+    pub fn typing(&self, now: Instant) -> bool {
+        !self.typed.is_empty()
+            && self
+                .typed_at
+                .is_some_and(|t| now.duration_since(t) < TYPEAHEAD_TIMEOUT)
+    }
+
+    /// Type-to-jump: extend the search with `text` and select the first
+    /// visible entry whose name starts with it (case-insensitive), searching
+    /// forward from the selection and wrapping. A lone character starts
+    /// *after* the selection and pressing the same one again cycles through
+    /// the entries with that initial. Returns whether the selection moved.
+    pub fn type_jump(&mut self, text: &str, now: Instant) -> bool {
+        if !self.typing(now) {
+            self.typed.clear();
+        }
+        for c in text.chars().filter(|c| !c.is_control()) {
+            if c.is_whitespace() && self.typed.is_empty() {
+                continue;
+            }
+            self.typed.push(c);
+        }
+        if self.typed.is_empty() {
+            return false;
+        }
+        self.typed_at = Some(now);
+
+        let lower: Vec<char> = self.typed.to_lowercase().chars().collect();
+        let first = lower[0];
+        let cycling = lower.iter().all(|&c| c == first);
+        let needle: String = if cycling {
+            first.to_string()
+        } else {
+            lower.iter().collect()
+        };
+        let start = if cycling {
+            self.selection + 1
+        } else {
+            self.selection
+        };
+        let names: Vec<String> = self
+            .visible_entries()
+            .iter()
+            .map(|e| {
+                if e.kind == EntryKind::ParentDir {
+                    String::new()
+                } else {
+                    e.label.to_lowercase()
+                }
+            })
+            .collect();
+        let n = names.len();
+        let hit = (0..n)
+            .map(|k| (start + k) % n)
+            .find(|&i| names[i].starts_with(&needle));
+        match hit {
+            Some(i) if i != self.selection => {
+                self.selection = i;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Keep thumbnails and tiles proportional. Re-decode on change; existing
@@ -134,7 +258,8 @@ impl ExplorerState {
 
     /// Selected entry, if any.
     pub fn selected(&self) -> Option<&Entry> {
-        self.entries.get(self.selection)
+        // `selection` indexes the filtered view, not `entries`.
+        self.visible_entries().get(self.selection).copied()
     }
 
     pub fn move_selection(&mut self, dx: isize, dy: isize) {
@@ -219,6 +344,7 @@ fn list_dir(dir: &Path) -> Vec<Entry> {
             path: parent.to_path_buf(),
             label: "⬆ Parent".into(),
             kind: EntryKind::ParentDir,
+            page: None,
         });
     }
 
@@ -244,6 +370,7 @@ fn list_dir(dir: &Path) -> Vec<Entry> {
                 path: p,
                 label,
                 kind: EntryKind::Folder,
+                page: None,
             });
         } else if ft.is_file() {
             if is_archive_path(&p) {
@@ -251,12 +378,14 @@ fn list_dir(dir: &Path) -> Vec<Entry> {
                     path: p,
                     label,
                     kind: EntryKind::Archive,
+                    page: None,
                 });
             } else if is_image_path(&p) {
                 images.push(Entry {
                     path: p,
                     label,
                     kind: EntryKind::Image,
+                    page: None,
                 });
             }
         }
@@ -268,6 +397,39 @@ fn list_dir(dir: &Path) -> Vec<Entry> {
     out.extend(folders);
     out.extend(archives);
     out.extend(images);
+    out
+}
+
+fn page_ref(pages: Option<&Arc<dyn PageSource>>, entry: &Entry) -> Option<PageRef> {
+    Some(PageRef {
+        source: pages?.clone(),
+        index: entry.page?,
+    })
+}
+
+/// Entries for an archive shown as thumbnails: a tile per page, in reading
+/// order, behind a parent tile that leaves the archive.
+fn list_pages(archive: &Path, src: &dyn PageSource) -> Vec<Entry> {
+    let mut out = Vec::with_capacity(src.len() + 1);
+    if let Some(parent) = archive.parent() {
+        out.push(Entry {
+            path: parent.to_path_buf(),
+            label: "⬆ Parent".into(),
+            kind: EntryKind::ParentDir,
+            page: None,
+        });
+    }
+    for i in 0..src.len() {
+        let name = src.entry_name(i).unwrap_or("");
+        let label = name.rsplit(['/', '\\']).next().unwrap_or(name).to_string();
+        out.push(Entry {
+            // Unique cache key; never touched on disk.
+            path: PathBuf::from(format!("{}\u{0}{i}", archive.display())),
+            label,
+            kind: EntryKind::Page,
+            page: Some(i),
+        });
+    }
     out
 }
 
@@ -338,7 +500,19 @@ pub fn draw(ui: &mut Ui, state: &mut ExplorerState) -> Option<Entry> {
     // Collect paths we rendered (so we can prefetch the N rows above/below
     // the visible clip on the next pass). `visible_rects` pairs each entry
     // with the rect we reserved for it inside the scroll area.
-    let mut visible_rects: Vec<(PathBuf, egui::Rect)> = Vec::new();
+    let mut visible_rects: Vec<(PathBuf, egui::Rect, Option<PageRef>)> = Vec::new();
+
+    // Centre the selected tile only when the selection (or what it indexes)
+    // changed, not every frame — otherwise mouse / trackpad scrolling snaps
+    // straight back to it.
+    let scroll_key = (
+        state.current.clone(),
+        state.filter.clone(),
+        state.selection,
+        state.tile_w.to_bits(),
+    );
+    let scroll_to_selection = state.scrolled_to.as_ref() != Some(&scroll_key);
+    let pages = state.pages.clone();
 
     let clip = ScrollArea::vertical()
         .auto_shrink([false; 2])
@@ -371,13 +545,19 @@ pub fn draw(ui: &mut Ui, state: &mut ExplorerState) -> Option<Entry> {
                             thumb_h,
                             thumb_size,
                             selected,
+                            selected && scroll_to_selection,
+                            pages.as_ref(),
                         );
                         if hit {
                             clicked = Some(entry.clone());
                         }
                         // The parent tile is a glyph, not a cover.
                         if entry.kind != EntryKind::ParentDir {
-                            visible_rects.push((entry.path.clone(), rect));
+                            visible_rects.push((
+                                entry.path.clone(),
+                                rect,
+                                page_ref(pages.as_ref(), entry),
+                            ));
                         }
                     }
                 });
@@ -391,6 +571,7 @@ pub fn draw(ui: &mut Ui, state: &mut ExplorerState) -> Option<Entry> {
     // queued at HIGH priority inside `draw_tile` via `thumbnail()`. Dedup in
     // the worker pool means re-calling this each frame is idempotent.
     prefetch_nearby(&state.cache, &visible_rects, clip, thumb_size);
+    state.scrolled_to = Some(scroll_key);
 
     clicked
 }
@@ -402,7 +583,7 @@ const PREFETCH_BUDGET_BYTES: usize = 128 << 20;
 
 fn prefetch_nearby(
     cache: &ThumbnailCache,
-    rects: &[(PathBuf, egui::Rect)],
+    rects: &[(PathBuf, egui::Rect, Option<PageRef>)],
     clip: egui::Rect,
     thumb_size: u32,
 ) {
@@ -415,10 +596,10 @@ fn prefetch_nearby(
     // FIFO, so this order is the order covers arrive in, and users mostly
     // scroll forward.
     let on_screen = |r: &egui::Rect| clip.intersects(*r);
-    let first = rects.iter().position(|(_, r)| on_screen(r)).unwrap_or(0);
+    let first = rects.iter().position(|(_, r, _)| on_screen(r)).unwrap_or(0);
     let last = rects
         .iter()
-        .rposition(|(_, r)| on_screen(r))
+        .rposition(|(_, r, _)| on_screen(r))
         .map_or(first, |i| i + 1);
     let mut below = rects[last..].iter();
     let mut above = rects[..first].iter().rev();
@@ -428,8 +609,8 @@ fn prefetch_nearby(
         if batch.iter().all(Option::is_none) {
             break;
         }
-        for (path, _) in batch.into_iter().flatten() {
-            cache.prefetch(path, thumb_size);
+        for (path, _, src) in batch.into_iter().flatten() {
+            cache.prefetch(path, thumb_size, src.as_ref());
             n += 1;
         }
     }
@@ -445,13 +626,15 @@ fn draw_tile(
     thumb_h: f32,
     thumb_size: u32,
     selected: bool,
+    scroll_into_view: bool,
+    pages: Option<&Arc<dyn PageSource>>,
 ) -> (bool, egui::Rect) {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(tile_w, tile_h), Sense::click());
 
     // Selection always requests scroll-into-view so keyboard nav can move
     // off-screen selection back into sight. Must run before the clip-rect
     // early-return below.
-    if selected {
+    if scroll_into_view {
         resp.scroll_to_me(Some(Align::Center));
     }
 
@@ -483,7 +666,7 @@ fn draw_tile(
         rect.min + Vec2::new(pad, pad),
         Vec2::new(tile_w - pad * 2.0, thumb_h),
     );
-    paint_thumb(ui, thumb_rect, entry, cache, thumb_size);
+    paint_thumb(ui, thumb_rect, entry, cache, thumb_size, pages);
 
     let label_rect = egui::Rect::from_min_size(
         rect.min + Vec2::new(pad, pad + thumb_h + 6.0),
@@ -493,7 +676,7 @@ fn draw_tile(
         EntryKind::ParentDir => Color32::LIGHT_BLUE,
         EntryKind::Folder => Color32::from_rgb(230, 200, 120),
         EntryKind::Archive => Color32::from_rgb(180, 220, 255),
-        EntryKind::Image => Color32::WHITE,
+        EntryKind::Image | EntryKind::Page => Color32::WHITE,
     };
     ui.allocate_new_ui(
         egui::UiBuilder::new()
@@ -522,6 +705,7 @@ fn paint_thumb(
     entry: &Entry,
     cache: &ThumbnailCache,
     thumb_size: u32,
+    pages: Option<&Arc<dyn PageSource>>,
 ) {
     let painter = ui.painter_at(rect);
     if entry.kind == EntryKind::ParentDir {
@@ -535,7 +719,7 @@ fn paint_thumb(
         return;
     }
 
-    match cache.thumbnail(&entry.path, thumb_size) {
+    match cache.thumbnail(&entry.path, thumb_size, page_ref(pages, entry).as_ref()) {
         ThumbStatus::Ready(tex) => {
             let s = tex.size_vec2();
             let scale = (rect.width() / s.x).min(rect.height() / s.y);
@@ -559,7 +743,7 @@ fn paint_thumb(
             let glyph = match entry.kind {
                 EntryKind::Folder => "📁",
                 EntryKind::Archive => "📦",
-                EntryKind::Image => "🖼",
+                EntryKind::Image | EntryKind::Page => "🖼",
                 EntryKind::ParentDir => "⬆",
             };
             painter.text(
@@ -570,5 +754,144 @@ fn paint_thumb(
                 Color32::DARK_GRAY,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Explorer over a temp dir holding `names` as (empty) folders.
+    fn explorer_with(names: &[&str]) -> (tempfile::TempDir, ExplorerState) {
+        let dir = tempfile::tempdir().unwrap();
+        for n in names {
+            fs::create_dir(dir.path().join(n)).unwrap();
+        }
+        let state = ExplorerState::new(&Context::default(), dir.path().to_path_buf());
+        (dir, state)
+    }
+
+    fn selected_label(s: &ExplorerState) -> String {
+        s.selected().unwrap().label.clone()
+    }
+
+    #[test]
+    fn type_jump_selects_by_prefix_case_insensitively() {
+        let (_d, mut s) = explorer_with(&["Alpha", "beta", "Bravo", "gamma"]);
+        let t = Instant::now();
+        assert!(s.type_jump("g", t));
+        assert_eq!(selected_label(&s), "gamma");
+        // A new search after the timeout; a longer prefix finds "Bravo".
+        let t2 = t + Duration::from_secs(5);
+        assert!(s.type_jump("br", t2));
+        assert_eq!(selected_label(&s), "Bravo");
+    }
+
+    #[test]
+    fn repeated_letter_cycles_through_initials() {
+        let (_d, mut s) = explorer_with(&["alpha", "beta", "bravo", "bulb"]);
+        let mut t = Instant::now();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            s.type_jump("b", t);
+            seen.push(selected_label(&s));
+            t += Duration::from_millis(100);
+        }
+        assert_eq!(seen, ["beta", "bravo", "bulb", "beta"]);
+    }
+
+    #[test]
+    fn typing_times_out_and_starts_a_new_search() {
+        let (_d, mut s) = explorer_with(&["abc", "xyz"]);
+        let t = Instant::now();
+        s.type_jump("x", t);
+        assert!(s.typing(t + Duration::from_millis(500)));
+        assert!(!s.typing(t + Duration::from_secs(2)));
+        // After the timeout "a" is a fresh search, not "xa".
+        assert!(s.type_jump("a", t + Duration::from_secs(2)));
+        assert_eq!(selected_label(&s), "abc");
+    }
+
+    #[test]
+    fn type_jump_matches_japanese_names() {
+        let (_d, mut s) = explorer_with(&["あいう", "かきく", "ABC"]);
+        assert!(s.type_jump("か", Instant::now()));
+        assert_eq!(selected_label(&s), "かきく");
+    }
+
+    #[test]
+    fn type_jump_ignores_leading_space_and_missing_matches() {
+        let (_d, mut s) = explorer_with(&["alpha"]);
+        let before = s.selection;
+        assert!(!s.type_jump(" ", Instant::now()));
+        assert!(!s.type_jump("q", Instant::now()));
+        assert_eq!(s.selection, before);
+    }
+
+    #[test]
+    fn type_jump_never_selects_the_parent_tile() {
+        let (_d, mut s) = explorer_with(&["alpha"]);
+        // "⬆ Parent" must not be reachable by typing its label.
+        assert!(!s.type_jump("p", Instant::now()));
+        assert_eq!(s.selected().unwrap().kind, EntryKind::ParentDir);
+    }
+
+    #[test]
+    fn selected_follows_the_filter() {
+        let (_d, mut s) = explorer_with(&["alpha", "beta"]);
+        s.filter = "beta".into();
+        s.selection = 0;
+        assert_eq!(selected_label(&s), "beta");
+    }
+
+    #[test]
+    fn archive_pages_are_listed_and_not_deletable() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("book.cbz");
+        {
+            use std::io::Write;
+            let mut w = zip::ZipWriter::new(fs::File::create(&zip_path).unwrap());
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let png = {
+                let mut out = Vec::new();
+                image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 8))
+                    .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+                    .unwrap();
+                out
+            };
+            for n in ["ch/10.png", "ch/2.png", "ch/1.png"] {
+                w.start_file(n, opts).unwrap();
+                w.write_all(&png).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let mut s = ExplorerState::new(&Context::default(), dir.path().to_path_buf());
+        assert!(s.show_pages(&zip_path, 1));
+        assert_eq!(s.browsing_archive(), Some(zip_path.as_path()));
+        let labels: Vec<_> = s.entries().iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(labels, ["⬆ Parent", "1.png", "2.png", "10.png"]);
+        // Page 1 (0-based) is selected: "2.png".
+        assert_eq!(selected_label(&s), "2.png");
+        assert_eq!(s.selected().unwrap().page, Some(1));
+        assert_eq!(
+            s.selected_path(),
+            None,
+            "pages must not be rename/delete targets"
+        );
+        // Leaving the archive restores the directory listing, archive selected.
+        s.go_parent();
+        assert!(s.browsing_archive().is_none());
+        assert_eq!(selected_label(&s), "book.cbz");
+    }
+
+    #[test]
+    fn show_pages_fails_cleanly_on_a_broken_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.zip");
+        fs::write(&bad, b"not a zip").unwrap();
+        let mut s = ExplorerState::new(&Context::default(), dir.path().to_path_buf());
+        assert!(!s.show_pages(&bad, 0));
+        assert!(s.browsing_archive().is_none());
     }
 }

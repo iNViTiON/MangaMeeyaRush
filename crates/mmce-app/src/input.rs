@@ -6,7 +6,7 @@ use mmce_config::BindDir;
 use crate::{App, View};
 
 pub fn handle(app: &mut App, ctx: &Context) {
-    let (keys, scroll, primary, secondary, modifiers) = ctx.input(|i| {
+    let (keys, texts, scroll, primary, secondary, modifiers) = ctx.input(|i| {
         (
             i.events
                 .iter()
@@ -21,6 +21,13 @@ pub fn handle(app: &mut App, ctx: &Context) {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Text(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
             i.smooth_scroll_delta,
             i.pointer.button_clicked(PointerButton::Primary),
             i.pointer.button_clicked(PointerButton::Secondary),
@@ -28,8 +35,22 @@ pub fn handle(app: &mut App, ctx: &Context) {
         )
     });
 
+    let was_explorer = app.view == View::Explorer;
     for (key, mods) in keys {
         dispatch_key(app, ctx, key, mods);
+    }
+
+    // Type-to-jump in the explorer. Text events (not key presses) so shifted
+    // characters, non-Latin layouts and IME-committed Japanese all work. Not
+    // while a text field has focus (filter bar, rename dialog), and not if a
+    // key this frame already left the explorer (`E`).
+    if was_explorer && app.view == View::Explorer && !ctx.wants_keyboard_input() {
+        let now = std::time::Instant::now();
+        if let Some(state) = app.explorer.as_mut() {
+            for t in &texts {
+                state.type_jump(t, now);
+            }
+        }
     }
 
     // Only fire click navigation in Book view — Explorer has its own click
@@ -106,7 +127,11 @@ fn dispatch_key(app: &mut App, ctx: &Context, key: Key, mods: Modifiers) {
             Key::Backspace => return app.explorer_up(),
             Key::Plus | Key::Equals if cmd_only => return app.explorer_thumb_bigger(),
             Key::Minus if cmd_only => return app.explorer_thumb_smaller(),
-            Key::E if plain => return app.toggle_explorer(ctx),
+            // `E` returns to the book, unless a type-to-jump search is under
+            // way (then it's just the next letter) or there's no book.
+            Key::E if plain && app.book.is_some() && !app.explorer_typing() => {
+                return app.toggle_explorer(ctx)
+            }
             // F5 refreshes the current directory.
             Key::F5 => return app.refresh_explorer(),
             // F2 renames, Delete deletes.
@@ -127,6 +152,9 @@ fn dispatch_key(app: &mut App, ctx: &Context, key: Key, mods: Modifiers) {
                 return;
             }
             Key::F11 | Key::Escape => { /* fall through to shared handler */ }
+            // Letters, digits, space and `-` belong to type-to-jump here (see
+            // the Text handling in `handle`), not to the book shortcuts.
+            k if (plain || shift_only) && is_typeahead_key(k) => return,
             _ => {
                 // fall through for dialogs / fullscreen / open
             }
@@ -272,4 +300,49 @@ fn forward_step(app: &mut App) {
 
 fn backward_step(app: &mut App) {
     app.backward_spread();
+}
+
+/// Keys whose text feeds type-to-jump in the explorer.
+fn is_typeahead_key(key: Key) -> bool {
+    use Key::*;
+    matches!(
+        key,
+        A | B
+            | C
+            | D
+            | E
+            | F
+            | G
+            | H
+            | I
+            | J
+            | K
+            | L
+            | M
+            | N
+            | O
+            | P
+            | Q
+            | R
+            | S
+            | T
+            | U
+            | V
+            | W
+            | X
+            | Y
+            | Z
+            | Num0
+            | Num1
+            | Num2
+            | Num3
+            | Num4
+            | Num5
+            | Num6
+            | Num7
+            | Num8
+            | Num9
+            | Space
+            | Minus
+    )
 }

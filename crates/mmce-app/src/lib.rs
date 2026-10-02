@@ -20,6 +20,7 @@ mod dialogs;
 #[doc(hidden)]
 pub mod explorer;
 mod file_ops;
+mod fonts;
 mod history;
 mod input;
 mod overlay;
@@ -212,6 +213,8 @@ impl App {
             app.explorer = Some(ExplorerState::new(&cc.egui_ctx, dir));
         }
 
+        fonts::install_system_fallbacks(&cc.egui_ctx);
+
         if app.viewer.fullscreen {
             cc.egui_ctx
                 .send_viewport_cmd(ViewportCommand::Fullscreen(true));
@@ -332,17 +335,37 @@ impl App {
                 // making it impossible to descend into the book's own
                 // subfolders. Also try to pre-select the current book so
                 // it's obvious where they came from.
+                //
+                // An archive opens as a grid of its own pages — the same
+                // thumbnail view a folder of images gets — with the page
+                // being read selected.
                 let dir = self.explorer_start_dir();
-                match self.explorer.as_mut() {
-                    Some(state) if state.current == dir => { /* already there */ }
-                    Some(state) => state.cd(dir),
-                    None => self.explorer = Some(ExplorerState::new(ctx, dir)),
-                }
-                if let (Some(state), Some(cur)) =
-                    (self.explorer.as_mut(), self.current_path.as_ref())
-                {
-                    if let Some(idx) = state.entries().iter().position(|e| &e.path == cur) {
-                        state.selection = idx;
+                let cursor = self.book.as_ref().map_or(0, |b| b.cursor());
+                let archive = self.current_path.clone().filter(|p| is_archive_path(p));
+                let showing_pages = match (archive, self.explorer.as_mut()) {
+                    (Some(a), Some(state)) => state.show_pages(&a, cursor),
+                    (Some(a), None) => {
+                        let mut state = ExplorerState::new(ctx, dir.clone());
+                        let ok = state.show_pages(&a, cursor);
+                        self.explorer = Some(state);
+                        ok
+                    }
+                    (None, _) => false,
+                };
+                if !showing_pages {
+                    match self.explorer.as_mut() {
+                        Some(state)
+                            if state.current == dir && state.browsing_archive().is_none() =>
+                        { /* already there */ }
+                        Some(state) => state.cd(dir),
+                        None => self.explorer = Some(ExplorerState::new(ctx, dir)),
+                    }
+                    if let (Some(state), Some(cur)) =
+                        (self.explorer.as_mut(), self.current_path.as_ref())
+                    {
+                        if let Some(idx) = state.entries().iter().position(|e| &e.path == cur) {
+                            state.selection = idx;
+                        }
                     }
                 }
                 View::Explorer
@@ -395,6 +418,27 @@ impl App {
             EntryKind::Archive | EntryKind::Image => {
                 self.open_path(ctx, &entry.path);
             }
+            EntryKind::Page => {
+                let (Some(page), Some(archive)) = (
+                    entry.page,
+                    self.explorer
+                        .as_ref()
+                        .and_then(|e| e.browsing_archive())
+                        .map(Path::to_path_buf),
+                ) else {
+                    return;
+                };
+                // Already reading this archive: just move to the page.
+                if self.current_path.as_deref() != Some(archive.as_path()) || self.book.is_none() {
+                    self.open_path(ctx, &archive);
+                }
+                if self.current_path.as_deref() == Some(archive.as_path()) {
+                    if let Some(b) = self.book.as_mut() {
+                        b.goto(page);
+                        self.view = View::Book;
+                    }
+                }
+            }
         }
     }
 
@@ -409,6 +453,13 @@ impl App {
         if let Some(state) = self.explorer.as_mut() {
             state.go_parent();
         }
+    }
+
+    /// A type-to-jump search is in progress in the explorer.
+    pub(crate) fn explorer_typing(&self) -> bool {
+        self.explorer
+            .as_ref()
+            .is_some_and(|e| e.typing(Instant::now()))
     }
 
     pub(crate) fn explorer_move(&mut self, dx: isize, dy: isize) {

@@ -17,6 +17,7 @@ egui.workspace = true
 egui_extras.workspace = true
 image.workspace = true
 natord.workspace = true
+fontdb = "0.23"
 rfd.workspace = true
 mmce-core = { path = "../mmce-core" }
 mmce-codecs = { path = "../mmce-codecs" }
@@ -27,3 +28,4 @@ mmce-store = { path = "../mmce-store" }
 
 [dev-dependencies]
 tempfile = "3"
+zip.workspace = true

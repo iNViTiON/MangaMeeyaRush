@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use egui::{ColorImage, Context, TextureHandle, TextureOptions};
 use image::GenericImageView;
-use mmce_codecs::{cover_image, decode_cover_image};
+use mmce_codecs::{cover_image, decode_cover_image, PageSource};
 
 struct Decoded {
     size: [usize; 2],
@@ -44,8 +44,18 @@ enum Priority {
     Low,
 }
 
+/// Where a thumbnail comes from when it is a page inside an archive that the
+/// explorer is browsing, rather than a path on disk. The tile's `path` is then
+/// only a unique cache key.
+#[derive(Clone)]
+pub struct PageRef {
+    pub source: Arc<dyn PageSource>,
+    pub index: usize,
+}
+
 struct Request {
     path: PathBuf,
+    src: Option<PageRef>,
     thumb_size: u32,
     gen: u64,
     priority: Priority,
@@ -90,6 +100,7 @@ impl Queue {
                 };
                 let merged = Request {
                     path: req.path,
+                    src: req.src,
                     thumb_size: req.thumb_size,
                     gen: req.gen,
                     priority,
@@ -364,7 +375,7 @@ impl ThumbnailCache {
     /// Returns a texture for `path` if decoded; otherwise schedules a decode
     /// and returns `Pending`. `Failed` means the path couldn't decode — the
     /// UI should fall back to an icon.
-    pub fn thumbnail(&self, path: &Path, thumb_size: u32) -> ThumbStatus {
+    pub fn thumbnail(&self, path: &Path, thumb_size: u32, src: Option<&PageRef>) -> ThumbStatus {
         self.counters.calls.fetch_add(1, Ordering::Relaxed);
         if let Some(status) = self.tex_status(path, thumb_size, true) {
             return status;
@@ -393,7 +404,7 @@ impl ThumbnailCache {
             }
         }
 
-        self.enqueue(path, thumb_size, Priority::High);
+        self.enqueue(path, src, thumb_size, Priority::High);
         // A texture at another size (tile size just changed) beats a
         // placeholder: draw it scaled until the re-decode lands.
         self.tex_status(path, thumb_size, false).unwrap_or_else(|| {
@@ -419,7 +430,7 @@ impl ThumbnailCache {
     /// Ask the worker pool to decode `path` in the background at low
     /// priority. Used to prefetch adjacent tiles so the user doesn't see
     /// spinners when they scroll.
-    pub fn prefetch(&self, path: &Path, thumb_size: u32) {
+    pub fn prefetch(&self, path: &Path, thumb_size: u32, src: Option<&PageRef>) {
         if let Some(e) = self.tex.lock().unwrap().map.get(path) {
             if e.satisfies(thumb_size) {
                 return;
@@ -430,10 +441,10 @@ impl ThumbnailCache {
                 return;
             }
         }
-        self.enqueue(path, thumb_size, Priority::Low);
+        self.enqueue(path, src, thumb_size, Priority::Low);
     }
 
-    fn enqueue(&self, path: &Path, thumb_size: u32, priority: Priority) {
+    fn enqueue(&self, path: &Path, src: Option<&PageRef>, thumb_size: u32, priority: Priority) {
         let newly_queued = {
             let mut g = self.inner.lock().unwrap();
             if g.pending.contains_key(path) {
@@ -448,6 +459,7 @@ impl ThumbnailCache {
         }
         let req = Request {
             path: path.to_path_buf(),
+            src: src.cloned(),
             thumb_size,
             gen: *self.gen.lock().unwrap(),
             priority,
@@ -522,7 +534,7 @@ fn spawn_worker(
                 inner.lock().unwrap().pending.remove(&req.path);
                 continue;
             }
-            let result = decode_cover(&req.path, req.thumb_size);
+            let result = decode_cover(&req.path, req.src.as_ref(), req.thumb_size);
             counters.decodes.fetch_add(1, Ordering::Relaxed);
             {
                 let mut g = inner.lock().unwrap();
@@ -580,10 +592,13 @@ fn worker_pool_size() -> usize {
     })
 }
 
-fn decode_cover(path: &Path, thumb_size: u32) -> Option<Decoded> {
+fn decode_cover(path: &Path, src: Option<&PageRef>, thumb_size: u32) -> Option<Decoded> {
     #[cfg(test)]
     tests::count_decode(path);
-    let bytes = cover_image(path)?;
+    let bytes = match src {
+        Some(p) => p.source.read(p.index).ok()?,
+        None => cover_image(path)?,
+    };
     // DCT-scaled decode for JPEG covers (libjpeg-turbo), full zune decode for
     // everything else. Returns an image whose longest edge is already ≥
     // `thumb_size`, so the fit-shrink below is cheap and never upscales.
@@ -655,7 +670,7 @@ mod tests {
     ) {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let all = paths.iter().all(|p| done(&cache.thumbnail(p, size)));
+            let all = paths.iter().all(|p| done(&cache.thumbnail(p, size, None)));
             if all {
                 return;
             }
@@ -688,7 +703,7 @@ mod tests {
         cache.cancel_queued();
         // First frame at the new size: the 64px texture is still served.
         for p in &paths {
-            match cache.thumbnail(p, 128) {
+            match cache.thumbnail(p, 128, None) {
                 ThumbStatus::Ready(t) => assert_eq!(t.size()[1], 64),
                 _ => panic!("tile blanked on resize"),
             }
@@ -708,7 +723,7 @@ mod tests {
         let paths = write_covers(dir.path(), 4, 64, 64);
         let cache = ThumbnailCache::new(Context::default(), 64);
         for p in &paths {
-            cache.prefetch(p, 32);
+            cache.prefetch(p, 32, None);
         }
         cache.cancel_dir();
         thread::sleep(Duration::from_millis(200));
@@ -726,6 +741,7 @@ mod tests {
         // Nothing queued for /a: a worker popped it and is decoding.
         let promoted = q.promote(Request {
             path: PathBuf::from("/a"),
+            src: None,
             thumb_size: 64,
             gen: 0,
             priority: Priority::High,
@@ -740,6 +756,7 @@ mod tests {
         for p in ["/a", "/b"] {
             q.push(Request {
                 path: PathBuf::from(p),
+                src: None,
                 thumb_size: 64,
                 gen: 0,
                 priority: Priority::Low,
@@ -747,6 +764,7 @@ mod tests {
         }
         assert!(q.promote(Request {
             path: PathBuf::from("/b"),
+            src: None,
             thumb_size: 128,
             gen: 0,
             priority: Priority::High,
@@ -766,6 +784,7 @@ mod tests {
         let mut q = Queue::new();
         q.push(Request {
             path: PathBuf::from("/a"),
+            src: None,
             thumb_size: 64,
             gen: 0,
             priority: Priority::Low,
@@ -781,12 +800,14 @@ mod tests {
         let mut q = Queue::new();
         q.push(Request {
             path: PathBuf::from("/a"),
+            src: None,
             thumb_size: 64,
             gen: 0,
             priority: Priority::Low,
         });
         q.push(Request {
             path: PathBuf::from("/b"),
+            src: None,
             thumb_size: 64,
             gen: 0,
             priority: Priority::High,
@@ -806,12 +827,14 @@ mod tests {
         let mut q = Queue::new();
         q.push(Request {
             path: PathBuf::from("/a"),
+            src: None,
             thumb_size: 64,
             gen: 0,
             priority: Priority::Low,
         });
         assert!(q.promote(Request {
             path: PathBuf::from("/a"),
+            src: None,
             thumb_size: 64,
             gen: 0,
             priority: Priority::High,
