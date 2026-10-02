@@ -44,7 +44,11 @@ pub fn paint_info(ui: &Ui, book: &Book, cache: &PageCache, spread: Spread) {
         Vec2::new(max_w + pad * 2.0, line_h * lines.len() as f32 + pad * 2.0),
     );
     painter.rect_filled(panel, 6.0, Color32::from_black_alpha(170));
-    painter.rect_stroke(panel, 6.0, Stroke::new(1.0, Color32::from_white_alpha(40)));
+    painter.rect_stroke(
+        panel,
+        6.0,
+        Stroke::new(1.0_f32, Color32::from_white_alpha(40)),
+    );
     for (i, line) in lines.iter().enumerate() {
         painter.text(
             origin + Vec2::new(pad, pad + i as f32 * line_h),
@@ -98,7 +102,7 @@ pub fn paint_loupe(
     painter.rect_stroke(
         loupe_rect,
         radius,
-        Stroke::new(2.0, Color32::from_white_alpha(180)),
+        Stroke::new(2.0_f32, Color32::from_white_alpha(180)),
     );
 }
 

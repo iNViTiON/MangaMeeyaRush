@@ -475,7 +475,7 @@ fn draw_tile(
     };
     painter.rect_filled(rect, 6.0, bg);
     if selected {
-        painter.rect_stroke(rect, 6.0, egui::Stroke::new(2.0, Color32::LIGHT_BLUE));
+        painter.rect_stroke(rect, 6.0, egui::Stroke::new(2.0_f32, Color32::LIGHT_BLUE));
     }
 
     let pad = 10.0;
