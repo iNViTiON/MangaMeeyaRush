@@ -31,7 +31,7 @@ image = { version = "0.25", default-features = false, features = [
 # zip >= 3 stopped seeking to every entry's local header inside
 # `ZipArchive::new` (2.x did N random reads per open — one per page — which
 # dominated cold explorer scans). 4.x is the newest line within our MSRV.
-zip = { version = "4", default-features = false, features = ["deflate-flate2-zlib-rs", "bzip2"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs", "bzip2"] }
 # Pull flate2 to the workspace with the zlib-rs backend. zip names the
 # zlib-rs backend itself (`deflate-flate2-zlib-rs`); this override keeps any
 # other transitive flate2 user off the default miniz_oxide backend — the
