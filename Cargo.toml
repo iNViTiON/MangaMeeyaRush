@@ -37,7 +37,7 @@ zip = { version = "4", default-features = false, features = ["deflate-flate2-zli
 # other transitive flate2 user off the default miniz_oxide backend — the
 # pure-Rust SIMD-accelerated zlib-rs port instead (PCLMUL CRC32, SSE4.2 inflate).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
-sevenz-rust2 = "0.17"
+sevenz-rust2 = "0.21"
 tar = "0.4"
 natord = "1.0"
 # libjpeg-turbo (SIMD) for DCT-domain downscale decode of cover thumbnails.
